@@ -1,11 +1,15 @@
-import unittest
+import csv
 import os
-import pandas as pd
-import tempfile
-import shutil
-import time
 import random
 import string
+import tempfile
+import time
+import unittest
+
+import pandas as pd
+import shutil
+import numpy as np
+
 from src.matcher import FuzzyMatcher
 from src.algorithms import (
     levenshtein_similarity,
@@ -14,37 +18,22 @@ from src.algorithms import (
 )
 
 
-def generate_random_name():
-    """Generate a random name."""
-    first_names = ['John', 'Jane', 'Robert', 'Mary', 'William', 'Patricia', 
-                   'Michael', 'Jennifer', 'David', 'Linda', 'Richard', 'Elizabeth',
-                   'Joseph', 'Susan', 'Thomas', 'Jessica', 'Charles', 'Sarah',
-                   'Christopher', 'Karen', 'Daniel', 'Nancy', 'Matthew', 'Lisa',
-                   'Anthony', 'Betty', 'Mark', 'Margaret', 'Donald', 'Sandra']
-    last_names = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia',
-                  'Miller', 'Davis', 'Rodriguez', 'Martinez', 'Hernandez', 'Lopez',
-                  'Wilson', 'Anderson', 'Thomas', 'Taylor', 'Moore', 'Jackson',
-                  'Martin', 'Lee', 'Thompson', 'White', 'Harris', 'Sanchez',
-                  'Clark', 'Ramirez', 'Lewis', 'Robinson', 'Walker', 'Young']
-    return f"{random.choice(first_names)} {random.choice(last_names)}"
+HEAVY_DATASET_TESTS = os.getenv("RUN_HEAVY_DATASET_TESTS", "").lower() in ("1", "true", "yes")
+
+DATAFRAME_CACHE = {}
 
 
-def generate_random_email(name=None):
-    """Generate a random email."""
-    if name:
-        base = name.lower().replace(' ', '.')
-    else:
-        base = ''.join(random.choices(string.ascii_lowercase, k=8))
-    domains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'test.com']
-    return f"{base}@{random.choice(domains)}"
-
-
-def generate_random_phone():
-    """Generate a random phone number."""
-    area = random.randint(200, 999)
-    exchange = random.randint(200, 999)
-    number = random.randint(1000, 9999)
-    return f"{area}{exchange}{number}"
+FIRST_NAMES = ['John', 'Jane', 'Robert', 'Mary', 'William', 'Patricia',
+               'Michael', 'Jennifer', 'David', 'Linda', 'Richard', 'Elizabeth',
+               'Joseph', 'Susan', 'Thomas', 'Jessica', 'Charles', 'Sarah',
+               'Christopher', 'Karen', 'Daniel', 'Nancy', 'Matthew', 'Lisa',
+               'Anthony', 'Betty', 'Mark', 'Margaret', 'Donald', 'Sandra']
+LAST_NAMES = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia',
+              'Miller', 'Davis', 'Rodriguez', 'Martinez', 'Hernandez', 'Lopez',
+              'Wilson', 'Anderson', 'Thomas', 'Taylor', 'Moore', 'Jackson',
+              'Martin', 'Lee', 'Thompson', 'White', 'Harris', 'Sanchez',
+              'Clark', 'Ramirez', 'Lewis', 'Robinson', 'Walker', 'Young']
+EMAIL_DOMAINS = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'test.com']
 
 
 def generate_random_address():
@@ -53,6 +42,34 @@ def generate_random_address():
     streets = ['Main St', 'Oak Ave', 'Park Blvd', 'Elm St', 'Maple Dr',
                'Cedar Ln', 'Pine Rd', 'First St', 'Second Ave', 'Third Blvd']
     return f"{numbers} {random.choice(streets)}"
+
+
+def _get_cached_dataframe(n_records: int) -> pd.DataFrame:
+    """Return cached DataFrame for heavy synthetic datasets."""
+    if n_records not in DATAFRAME_CACHE:
+        rng = np.random.default_rng(seed=n_records)
+        first = rng.choice(FIRST_NAMES, size=n_records)
+        last = rng.choice(LAST_NAMES, size=n_records)
+        names = [f"{f} {l}" for f, l in zip(first, last)]
+        domain_choices = rng.choice(EMAIL_DOMAINS, size=n_records)
+        emails = []
+        for name, domain in zip(names, domain_choices):
+            if rng.random() > 0.2:
+                base = name.lower().replace(' ', '.')
+            else:
+                letters = rng.choice(list(string.ascii_lowercase), size=8)
+                base = ''.join(letters)
+            emails.append(f"{base}@{domain}")
+        area_codes = rng.integers(200, 1000, size=n_records)
+        exchanges = rng.integers(200, 1000, size=n_records)
+        line_nums = rng.integers(1000, 10000, size=n_records)
+        phones = [f"{a}{e}{l}" for a, e, l in zip(area_codes, exchanges, line_nums)]
+        DATAFRAME_CACHE[n_records] = pd.DataFrame({
+            'name': names,
+            'email': emails,
+            'phone': phones
+        })
+    return DATAFRAME_CACHE[n_records].copy(deep=True)
 
 
 class TestLargeDatasetPerformance(unittest.TestCase):
@@ -68,29 +85,27 @@ class TestLargeDatasetPerformance(unittest.TestCase):
         if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
     
+    def _write_simple_csv(self, path: str, n_records: int, prefix: str = "Person"):
+        """Write a simple single-column CSV for heavy dataset tests."""
+        with open(path, 'w', newline='', encoding='utf-8') as handle:
+            writer = csv.writer(handle)
+            writer.writerow(['name'])
+            for i in range(n_records):
+                writer.writerow([f"{prefix} {i}"])
+
+    def _write_cached_pair(self, file1: str, file2: str, n_records: int):
+        """Write cached synthetic dataset to both files to avoid regeneration."""
+        df = _get_cached_dataframe(n_records)
+        df.to_csv(file1, index=False)
+        df.to_csv(file2, index=False)
+    
     def test_10k_records(self):
         """Test matching with 10,000 records."""
         n_records = 10000
         
-        source1_data = {
-            'name': [generate_random_name() for _ in range(n_records)],
-            'email': [generate_random_email() for _ in range(n_records)],
-            'phone': [generate_random_phone() for _ in range(n_records)]
-        }
-        
-        source2_data = {
-            'name': [name for name in source1_data['name']],
-            'email': [email for email in source1_data['email']],
-            'phone': [phone for phone in source1_data['phone']]
-        }
-        
-        df1 = pd.DataFrame(source1_data)
-        df2 = pd.DataFrame(source2_data)
-        
         file1 = os.path.join(self.temp_dir, 'source1_10k.csv')
         file2 = os.path.join(self.temp_dir, 'source2_10k.csv')
-        df1.to_csv(file1, index=False)
-        df2.to_csv(file2, index=False)
+        self._write_cached_pair(file1, file2, n_records)
         
         config = {
             'source1': file1,
@@ -104,7 +119,8 @@ class TestLargeDatasetPerformance(unittest.TestCase):
                 ],
                 'threshold': 0.85,
                 'use_multiprocessing': True,
-                'num_workers': 4
+                'num_workers': 4,
+                'blocking_strategies': ['first_char', 'three_gram']
             }
         }
         
@@ -120,26 +136,9 @@ class TestLargeDatasetPerformance(unittest.TestCase):
     def test_50k_records(self):
         """Test matching with 50,000 records."""
         n_records = 50000
-        
-        source1_data = {
-            'name': [generate_random_name() for _ in range(n_records)],
-            'email': [generate_random_email() for _ in range(n_records)],
-            'phone': [generate_random_phone() for _ in range(n_records)]
-        }
-        
-        source2_data = {
-            'name': [name for name in source1_data['name']],
-            'email': [email for email in source1_data['email']],
-            'phone': [phone for phone in source1_data['phone']]
-        }
-        
-        df1 = pd.DataFrame(source1_data)
-        df2 = pd.DataFrame(source2_data)
-        
         file1 = os.path.join(self.temp_dir, 'source1_50k.csv')
         file2 = os.path.join(self.temp_dir, 'source2_50k.csv')
-        df1.to_csv(file1, index=False)
-        df2.to_csv(file2, index=False)
+        self._write_cached_pair(file1, file2, n_records)
         
         config = {
             'source1': file1,
@@ -154,7 +153,8 @@ class TestLargeDatasetPerformance(unittest.TestCase):
                 'threshold': 0.85,
                 'use_multiprocessing': True,
                 'num_workers': 4,
-                'chunk_size': 5000
+                'chunk_size': 5000,
+                'blocking_strategies': ['first_char', 'three_gram']
             }
         }
         
@@ -170,26 +170,9 @@ class TestLargeDatasetPerformance(unittest.TestCase):
     def test_100k_records(self):
         """Test matching with 100,000 records."""
         n_records = 100000
-        
-        source1_data = {
-            'name': [generate_random_name() for _ in range(n_records)],
-            'email': [generate_random_email() for _ in range(n_records)],
-            'phone': [generate_random_phone() for _ in range(n_records)]
-        }
-        
-        source2_data = {
-            'name': [name for name in source1_data['name']],
-            'email': [email for email in source1_data['email']],
-            'phone': [phone for phone in source1_data['phone']]
-        }
-        
-        df1 = pd.DataFrame(source1_data)
-        df2 = pd.DataFrame(source2_data)
-        
         file1 = os.path.join(self.temp_dir, 'source1_100k.csv')
         file2 = os.path.join(self.temp_dir, 'source2_100k.csv')
-        df1.to_csv(file1, index=False)
-        df2.to_csv(file2, index=False)
+        self._write_cached_pair(file1, file2, n_records)
         
         config = {
             'source1': file1,
@@ -205,7 +188,8 @@ class TestLargeDatasetPerformance(unittest.TestCase):
                 'use_multiprocessing': True,
                 'num_workers': 4,
                 'chunk_size': 10000,
-                'early_termination': True
+                'early_termination': True,
+                'blocking_strategies': ['first_char', 'three_gram']
             }
         }
         
@@ -217,28 +201,48 @@ class TestLargeDatasetPerformance(unittest.TestCase):
         self.assertGreater(len(results), 0)
         print(f"100K records matched in {elapsed:.2f} seconds")
     
+    @unittest.skipUnless(HEAVY_DATASET_TESTS, "Set RUN_HEAVY_DATASET_TESTS=1 to run heavy 100K streaming test")
+    def test_100k_records_streaming(self):
+        """Test streaming workflow with 100,000 minimalist records."""
+        n_records = 100000
+        file1 = os.path.join(self.temp_dir, 'heavy_source1_100k.csv')
+        file2 = os.path.join(self.temp_dir, 'heavy_source2_100k.csv')
+        stream_output = os.path.join(self.temp_dir, 'stream_100k.csv')
+        
+        self._write_simple_csv(file1, n_records, prefix="Alpha")
+        self._write_simple_csv(file2, n_records, prefix="Alpha")
+        
+        config = {
+            'source1': file1,
+            'source2': file2,
+            'output': stream_output,
+            'match_config': {
+                'columns': [
+                    {'source1': 'name', 'source2': 'name', 'weight': 1.0}
+                ],
+                'threshold': 0.95,
+                'use_multiprocessing': True,
+                'num_workers': 8,
+                'chunk_size': 20000,
+                'early_termination': True
+            }
+        }
+        
+        matcher = FuzzyMatcher(config)
+        results = matcher.match(stream_to_file=stream_output)
+        
+        self.assertTrue(os.path.exists(stream_output), "Streaming output not created")
+        self.assertEqual(len(results), n_records)
+    
     def test_unequal_sized_datasets(self):
         """Test matching with unequal dataset sizes."""
         source1_size = 1000
         source2_size = 10000
         
-        source1_data = {
-            'name': [generate_random_name() for _ in range(source1_size)],
-            'email': [generate_random_email() for _ in range(source1_size)],
-            'phone': [generate_random_phone() for _ in range(source1_size)]
-        }
-        
-        source2_data = {
-            'name': [generate_random_name() for _ in range(source2_size)],
-            'email': [generate_random_email() for _ in range(source2_size)],
-            'phone': [generate_random_phone() for _ in range(source2_size)]
-        }
-        
-        df1 = pd.DataFrame(source1_data)
-        df2 = pd.DataFrame(source2_data)
-        
         file1 = os.path.join(self.temp_dir, 'source1_1k.csv')
         file2 = os.path.join(self.temp_dir, 'source2_10k.csv')
+        df1 = _get_cached_dataframe(source1_size)
+        df2 = _get_cached_dataframe(source2_size)
         df1.to_csv(file1, index=False)
         df2.to_csv(file2, index=False)
         
@@ -264,6 +268,83 @@ class TestLargeDatasetPerformance(unittest.TestCase):
         self.assertGreater(len(results), 0)
         self.assertLess(elapsed, 120, "1K vs 10K should complete in under 2 minutes")
         print(f"1K vs 10K matched in {elapsed:.2f} seconds")
+
+    def test_blocking_and_candidate_limits(self):
+        """Ensure blocking and candidate capping settings take effect."""
+        n_records = 500
+        duplicated_name = "Alpha Echo"
+        emails = [f"user{i}@example.com" for i in range(n_records)]
+        phones = [f"555000{i:04d}" for i in range(n_records)]
+        df = pd.DataFrame({
+            'name': [duplicated_name] * n_records,
+            'email': emails,
+            'phone': phones
+        })
+        file1 = os.path.join(self.temp_dir, 'limit_source1.csv')
+        file2 = os.path.join(self.temp_dir, 'limit_source2.csv')
+        df.to_csv(file1, index=False)
+        df.to_csv(file2, index=False)
+        
+        config = {
+            'source1': file1,
+            'source2': file2,
+            'output': self.output_path,
+            'match_config': {
+                'columns': [
+                    {'source1': 'name', 'source2': 'name', 'weight': 0.4},
+                    {'source1': 'email', 'source2': 'email', 'weight': 0.4},
+                    {'source1': 'phone', 'source2': 'phone', 'weight': 0.2}
+                ],
+                'threshold': 0.85,
+                'use_multiprocessing': False,
+                'max_block_size': 50,
+                'skip_high_cardinality': False,
+                'max_candidates': 10,
+                'candidate_trim_strategy': 'truncate',
+                'blocking_strategies': ['first_char']
+            }
+        }
+        
+        matcher = FuzzyMatcher(config)
+        matcher.match()
+        
+        self.assertGreaterEqual(matcher.blocking_stats.get('trimmed_keys', 0), 1)
+        self.assertGreaterEqual(matcher.candidate_stats.get('capped_rows', 0), 1)
+    
+    @unittest.skipUnless(HEAVY_DATASET_TESTS, "Set RUN_HEAVY_DATASET_TESTS=1 to run 500K row streaming test")
+    def test_500k_records_streaming(self):
+        """Test streaming workflow with 500,000 minimalist records."""
+        n_records = 500000
+        file1 = os.path.join(self.temp_dir, 'heavy_source1_500k.csv')
+        file2 = os.path.join(self.temp_dir, 'heavy_source2_500k.csv')
+        stream_output = os.path.join(self.temp_dir, 'stream_500k.csv')
+        
+        self._write_simple_csv(file1, n_records, prefix="Omega")
+        self._write_simple_csv(file2, n_records, prefix="Omega")
+        
+        config = {
+            'source1': file1,
+            'source2': file2,
+            'output': stream_output,
+            'match_config': {
+                'columns': [
+                    {'source1': 'name', 'source2': 'name', 'weight': 1.0}
+                ],
+                'threshold': 0.95,
+                'use_multiprocessing': True,
+                'num_workers': 8,
+                'chunk_size': 50000,
+                'early_termination': True,
+                'perfect_match_threshold': 0.999
+            }
+        }
+        
+        matcher = FuzzyMatcher(config)
+        results = matcher.match(stream_to_file=stream_output)
+        
+        self.assertTrue(os.path.exists(stream_output), "Streaming output not created for 500K rows")
+        self.assertEqual(len(results), n_records)
+        self.assertTrue((results['overall_score'] >= 0.95).all())
 
 
 class TestMatchingAccuracy(unittest.TestCase):

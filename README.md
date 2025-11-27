@@ -125,6 +125,15 @@ For a complete configuration reference, see [CONFIGURATION.md](CONFIGURATION.md)
 }
 ```
 
+### Column Mapping Between Datasets
+
+The engine builds a column map between `source1` and `source2` in two phases:
+
+- **Auto-analysis**: If `match_config.columns` is omitted, `column_analyzer.py` inspects both tables, infers the data type for every column, and auto-pairs columns that share the same header name (e.g., `email` ↔ `email`). Each inferred pair stores its detected type so the matcher can pick the right similarity algorithm.
+- **Explicit mappings**: When you provide `match_config.columns`, each entry pins an exact pair using the `source1` and `source2` keys and can include a `weight` (default `1.0`). Only the listed pairs are evaluated, which lets you map differently named columns such as `name` ↔ `full_name` or control how much each column influences the final score.
+
+Regardless of how pairs are defined, the output file keeps both originals prefixed with `source1_` / `source2_` (e.g., `source1_email`, `source2_email_address`) so you can audit the mapping that produced a score.
+
 ### Supported Data Sources
 
 - **CSV Files**: Local file paths
@@ -191,6 +200,8 @@ python -m pytest tests/test_integration.py -v
 ```bash
 python -m pytest tests/test_large_scale_accuracy.py::TestLargeDatasetPerformance -v
 ```
+
+To exercise the optional 100K streaming and 500K stress tests, set `RUN_HEAVY_DATASET_TESTS=1` before running pytest.
 
 ### Accuracy Metrics
 

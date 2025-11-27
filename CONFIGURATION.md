@@ -300,6 +300,44 @@ The `match_config` section controls how matching is performed.
 | `undecided_range` | number | No | 0.05 | Range around threshold for undecided matches (0-1) |
 | `return_all_matches` | boolean | No | false | Return all matches above threshold instead of best match only |
 
+### Performance Tuning
+
+Use these optional flags inside `match_config` to control throughput when working with large datasets:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `use_multiprocessing` | boolean | true | Enables multi-process execution for chunked matching. Disable if the environment has high process start overhead. |
+| `num_workers` | integer | min(cpu_count, 8) | Limits the number of worker processes used when multiprocessing is enabled. |
+| `chunk_size` | integer | 10000 | Number of source1 rows per chunk submitted to workers. Larger chunks reduce scheduling overhead at the cost of higher peak memory. |
+| `load_chunk_size` | integer | 100000 | Chunk size used while loading CSV/MySQL data. Reduce if you hit memory limits while loading. |
+| `early_termination` | boolean | true | Stops scoring remaining columns once a match is already above the `perfect_match_threshold`. |
+| `perfect_match_threshold` | number | 0.99 | Score required to trigger early termination when enabled. |
+| `blocking_strategies` | array | `["first_char","three_gram","last_three"]` | Controls which blocking keys are generated. Fewer strategies build smaller indexes and reduce serialization time. Valid tokens: `first_char`, `two_gram`, `three_gram`, `last_three`, `word_prefix`, `word_suffix`. |
+| `max_block_size` | integer | null | Maximum number of source2 rows allowed per blocking key. Larger buckets are either trimmed or skipped depending on `skip_high_cardinality`. |
+| `skip_high_cardinality` | boolean | true | When true, blocking keys exceeding `max_block_size` are dropped entirely; when false, they are truncated to the cap. |
+| `max_candidates` | integer | null | Caps the number of candidate rows evaluated per source1 record. Helpful when blocking still yields thousands of matches. |
+| `candidate_trim_strategy` | string | `"truncate"` | Strategy to enforce `max_candidates`. `"truncate"` keeps the first N candidates, `"fallback"` retries using only higher-priority keys before truncating. |
+
+Example:
+
+```json
+{
+  "match_config": {
+    "threshold": 0.9,
+    "use_multiprocessing": true,
+    "num_workers": 6,
+    "chunk_size": 8000,
+    "blocking_strategies": ["first_char", "three_gram"],
+    "max_block_size": 2500,
+    "skip_high_cardinality": false,
+    "max_candidates": 500,
+    "candidate_trim_strategy": "fallback"
+  }
+}
+```
+
+**Note:** When multiprocessing is enabled, the matcher automatically mirrors source data and normalized columns into OS-level shared memory blocks so workers avoid reloading or copying large arrays.
+
 ### Column Mapping
 
 Each column mapping specifies:
