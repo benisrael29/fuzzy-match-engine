@@ -635,10 +635,14 @@ class FuzzyMatcher:
             columns.extend([f"score_{col1}" for col1, _ in self.column_analyses.keys()])
             columns.extend(['overall_score', 'match_result', 'source1_index', 'source2_index'])
         
-        write_results_streaming(result_generator(), output_path, columns)
+        write_results_streaming(result_generator(), output_path, columns, config=self.config)
         
         elapsed_time = time.time() - start_time
         print(f"Matching completed in {elapsed_time:.2f} seconds")
         print(f"Found {results_written} matches (streamed to {output_path})")
         
-        return pd.read_csv(output_path)
+        from .output_writer import _is_s3_path, _read_from_s3
+        if _is_s3_path(output_path):
+            return _read_from_s3(output_path, config=self.config)
+        else:
+            return pd.read_csv(output_path)

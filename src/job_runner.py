@@ -90,7 +90,7 @@ class JobRunner:
                 print(f"\n[4/4] Writing results to {validated_config['output']}...")
                 write_start_time = time.time()
                 try:
-                    write_results(results, validated_config['output'], stream=len(results) > 50000)
+                    write_results(results, validated_config['output'], stream=len(results) > 50000, config=validated_config)
                     write_time = time.time() - write_start_time
                     print(f"✓ Results written successfully in {write_time:.2f} seconds")
                 except Exception as e:
@@ -119,19 +119,28 @@ class JobRunner:
 
 def validate_config_dict(config: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Validate configuration dictionary (without file path).
+    Validate configuration dictionary (without file path) and resolve environment variables.
     
     Args:
         config: Configuration dictionary
     
     Returns:
-        Validated configuration dictionary
+        Validated configuration dictionary with environment variables resolved
     
     Raises:
         ValueError: If configuration is invalid
     """
     from jsonschema import validate, ValidationError, SchemaError
-    from .config_validator import CONFIG_SCHEMA
+    from .config_validator import CONFIG_SCHEMA, _resolve_env_vars
+    
+    try:
+        from dotenv import load_dotenv
+        if os.path.exists('.env'):
+            load_dotenv('.env')
+    except ImportError:
+        pass
+    
+    config = _resolve_env_vars(config)
     
     try:
         validate(instance=config, schema=CONFIG_SCHEMA)

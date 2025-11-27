@@ -123,16 +123,21 @@ def _load_from_s3(
 
 
 def _get_s3_client(s3_credentials: Optional[Dict] = None):
-    """Create and return an S3 client with optional credentials."""
+    """Create and return an S3 client with optional credentials, or use IAM role."""
     if s3_credentials:
-        return boto3.client(
-            's3',
-            aws_access_key_id=s3_credentials.get('aws_access_key_id'),
-            aws_secret_access_key=s3_credentials.get('aws_secret_access_key'),
-            region_name=s3_credentials.get('region_name', 'us-east-1')
-        )
-    else:
-        return boto3.client('s3')
+        aws_access_key_id = s3_credentials.get('aws_access_key_id')
+        aws_secret_access_key = s3_credentials.get('aws_secret_access_key')
+        region_name = s3_credentials.get('region_name', 'us-east-1')
+        
+        if aws_access_key_id and aws_secret_access_key:
+            return boto3.client(
+                's3',
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key,
+                region_name=region_name
+            )
+    
+    return boto3.client('s3')
 
 
 def _load_from_csv(file_path: str, chunk_size: Optional[int] = None) -> pd.DataFrame:

@@ -134,7 +134,7 @@ def main():
             print(results['match_result'].value_counts().to_string())
         
         print(f"\nWriting results to {config['output']}...")
-        write_results(results, config['output'])
+        write_results(results, config['output'], config=config)
         
         print("Done!")
         
