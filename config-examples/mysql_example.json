@@ -1,0 +1,12 @@
+{
+  "source1": "master_data.csv",
+  "source2": "customers",
+  "mysql_credentials": {
+    "host": "localhost",
+    "user": "user",
+    "password": "pass",
+    "database": "dbname"
+  },
+  "output": "results/matches.csv"
+}
+

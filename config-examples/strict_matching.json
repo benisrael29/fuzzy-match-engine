@@ -1,0 +1,28 @@
+{
+  "source1": "data/customers_master.csv",
+  "source2": "data/customers_new.csv",
+  "output": "results/strict_matches.csv",
+  "match_config": {
+    "columns": [
+      {
+        "source1": "full_name",
+        "source2": "customer_name",
+        "weight": 0.4
+      },
+      {
+        "source1": "email",
+        "source2": "email_address",
+        "weight": 0.4
+      },
+      {
+        "source1": "phone",
+        "source2": "phone_number",
+        "weight": 0.2
+      }
+    ],
+    "threshold": 0.90,
+    "undecided_range": 0.03,
+    "return_all_matches": true
+  }
+}
+

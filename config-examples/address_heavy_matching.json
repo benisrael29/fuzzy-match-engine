@@ -1,0 +1,33 @@
+{
+  "source1": "data/addresses_master.csv",
+  "source2": "data/addresses_new.csv",
+  "output": "results/address_matches.csv",
+  "match_config": {
+    "columns": [
+      {
+        "source1": "name",
+        "source2": "full_name",
+        "weight": 0.2
+      },
+      {
+        "source1": "street_address",
+        "source2": "address",
+        "weight": 0.4
+      },
+      {
+        "source1": "city",
+        "source2": "city_name",
+        "weight": 0.2
+      },
+      {
+        "source1": "zip_code",
+        "source2": "postal_code",
+        "weight": 0.2
+      }
+    ],
+    "threshold": 0.75,
+    "undecided_range": 0.08,
+    "return_all_matches": true
+  }
+}
+

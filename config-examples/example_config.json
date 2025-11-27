@@ -1,7 +1,7 @@
 {
-  "source1": "tests/fixtures/test_data.csv",
-  "source2": "tests/fixtures/test_data2.csv",
-  "output": "tests/fixtures/test_results.csv",
+  "source1": "data/master.csv",
+  "source2": "data/new_records.csv",
+  "output": "results/matches.csv",
   "match_config": {
     "columns": [
       {
@@ -30,8 +30,9 @@
         "weight": 0.1
       }
     ],
-    "threshold": 0.75,
-    "undecided_range": 0.05
+    "threshold": 0.85,
+    "undecided_range": 0.05,
+    "return_all_matches": false
   }
 }
 

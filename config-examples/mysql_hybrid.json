@@ -1,0 +1,33 @@
+{
+  "source1": "data/master.csv",
+  "source2": "customer_table",
+  "mysql_credentials": {
+    "host": "localhost",
+    "user": "dbuser",
+    "password": "dbpass",
+    "database": "customer_db"
+  },
+  "output": "results/mysql_hybrid_matches.csv",
+  "match_config": {
+    "columns": [
+      {
+        "source1": "name",
+        "source2": "customer_name",
+        "weight": 0.4
+      },
+      {
+        "source1": "email",
+        "source2": "email",
+        "weight": 0.4
+      },
+      {
+        "source1": "phone",
+        "source2": "phone",
+        "weight": 0.2
+      }
+    ],
+    "threshold": 0.85,
+    "undecided_range": 0.05
+  }
+}
+

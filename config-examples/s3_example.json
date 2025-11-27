@@ -1,7 +1,12 @@
 {
-  "source1": "tests/fixtures/test_data.csv",
-  "source2": "tests/fixtures/test_data2.csv",
-  "output": "tests/fixtures/test_results.csv",
+  "source1": "s3://my-bucket/data/master.csv",
+  "source2": "data/new_records.csv",
+  "output": "results/matches.csv",
+  "s3_credentials": {
+    "aws_access_key_id": "YOUR_ACCESS_KEY",
+    "aws_secret_access_key": "YOUR_SECRET_KEY",
+    "region_name": "us-east-1"
+  },
   "match_config": {
     "columns": [
       {
@@ -30,7 +35,7 @@
         "weight": 0.1
       }
     ],
-    "threshold": 0.75,
+    "threshold": 0.85,
     "undecided_range": 0.05
   }
 }
