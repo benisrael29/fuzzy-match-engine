@@ -180,42 +180,30 @@ Example: With threshold 0.85 and undecided_range 0.05:
 
 ## Testing
 
-Run the test suite:
+### Core Suite
 
 ```bash
 python -m pytest tests/test_integration.py -v
 ```
 
+### Large Dataset Benchmarks
+
+```bash
+python -m pytest tests/test_large_scale_accuracy.py::TestLargeDatasetPerformance -v
+```
+
+### Accuracy Metrics
+
+```bash
+python -m pytest tests/test_accuracy_metrics.py -v
+```
+
 Tests cover:
-- End-to-end matching workflow
-- Name variations (Bob/Robert)
-- Address variations (St vs Street)
-- Phone number format differences
-- Date format variations
-- Performance with 1K+ rows
-
-## Project Structure
-
-```
-match-engine/
-├── src/
-│   ├── __init__.py
-│   ├── matcher.py              # Main matching engine
-│   ├── algorithms.py            # Fuzzy matching algorithms
-│   ├── column_analyzer.py       # Column type detection
-│   ├── data_loader.py           # CSV and MySQL loading
-│   ├── config_validator.py      # JSON config validation
-│   ├── normalizers.py           # Data normalization
-│   └── output_writer.py         # CSV output generation
-├── config/
-│   └── example_config.json      # Example configurations
-├── tests/
-│   ├── test_integration.py      # Integration tests
-│   └── fixtures/                # Test data
-├── main.py                      # CLI entry point
-├── requirements.txt
-└── README.md
-```
+- End-to-end matching workflow plus result export validation
+- Large dataset performance (10K, 50K, 100K rows and uneven set sizes)
+- Detailed accuracy metrics (precision/recall/F1, score distributions, false positives)
+- Name, address, phone, email, and date variations
+- Noise tolerance (typos, missing data) and partial matches
 
 ## Dependencies
 
