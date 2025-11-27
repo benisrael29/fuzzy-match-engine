@@ -641,8 +641,14 @@ class FuzzyMatcher:
         print(f"Matching completed in {elapsed_time:.2f} seconds")
         print(f"Found {results_written} matches (streamed to {output_path})")
         
-        from .output_writer import _is_s3_path, _read_from_s3
+        from .output_writer import _is_s3_path, _read_from_s3, _is_mysql_table, _get_mysql_engine
+        from sqlalchemy import text
+        
         if _is_s3_path(output_path):
             return _read_from_s3(output_path, config=self.config)
+        elif _is_mysql_table(output_path, self.config.get('mysql_credentials')):
+            mysql_credentials = self.config.get('mysql_credentials')
+            engine = _get_mysql_engine(mysql_credentials)
+            return pd.read_sql(text(f"SELECT * FROM `{output_path}`"), engine)
         else:
             return pd.read_csv(output_path)

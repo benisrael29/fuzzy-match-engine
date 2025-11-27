@@ -47,7 +47,22 @@ CONFIG_SCHEMA = {
                 }
             ]
         },
-        "output": {"type": "string"},
+        "output": {
+            "oneOf": [
+                {"type": "string"},
+                {
+                    "type": "object",
+                    "properties": {
+                        "table": {"type": "string"},
+                        "host": {"type": "string"},
+                        "user": {"type": "string"},
+                        "password": {"type": "string"},
+                        "database": {"type": "string"}
+                    },
+                    "required": ["table"]
+                }
+            ]
+        },
         "mysql_credentials": {
             "type": "object",
             "properties": {
@@ -165,6 +180,19 @@ def _validate_file_paths(config: Dict[str, Any]):
                     f"CSV file not found: {source}\n"
                     f"Please check the path, use S3 URL (s3://bucket/key), or use MySQL table name with mysql_credentials."
                 )
+    
+    output = config.get('output')
+    if isinstance(output, str):
+        if output.startswith('s3://'):
+            return
+        if not output.endswith('.csv'):
+            return
+        output_dir = os.path.dirname(output)
+        if output_dir and not os.path.exists(output_dir):
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+            except Exception:
+                pass
 
 
 def _resolve_env_vars(obj: Any) -> Any:
