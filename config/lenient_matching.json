@@ -1,0 +1,28 @@
+{
+  "source1": "data/employees_master.csv",
+  "source2": "data/employees_new.csv",
+  "output": "results/lenient_matches.csv",
+  "match_config": {
+    "columns": [
+      {
+        "source1": "name",
+        "source2": "full_name",
+        "weight": 0.5
+      },
+      {
+        "source1": "email",
+        "source2": "email",
+        "weight": 0.3
+      },
+      {
+        "source1": "department",
+        "source2": "dept",
+        "weight": 0.2
+      }
+    ],
+    "threshold": 0.65,
+    "undecided_range": 0.10,
+    "return_all_matches": true
+  }
+}
+

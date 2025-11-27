@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Any
-from multiprocessing import cpu_count
+from multiprocessing import cpu_count, Manager
 from functools import partial
 import time
 from tqdm import tqdm
@@ -14,6 +14,207 @@ from .normalizers import (
     normalize_name,
     normalize_string
 )
+
+
+def _match_chunk_worker(chunk_indices: List[int], match_data: Dict) -> List[Dict]:
+    """Worker function for parallel processing (must be at module level for pickling)."""
+    import pandas as pd
+    import numpy as np
+    
+    results = []
+    source1_data = match_data['source1_data']
+    source1_cols = match_data['source1_cols']
+    source2_data = match_data['source2_data']
+    source2_cols = match_data['source2_cols']
+    source1_normalized = match_data['source1_normalized']
+    source2_normalized = match_data['source2_normalized']
+    column_analyses = match_data['column_analyses']
+    blocking_index = match_data['blocking_index']
+    threshold = match_data['threshold']
+    undecided_range = match_data['undecided_range']
+    return_all_matches = match_data['return_all_matches']
+    early_termination = match_data.get('early_termination', True)
+    perfect_match_threshold = match_data.get('perfect_match_threshold', 0.99)
+    
+    lower_bound = threshold - undecided_range
+    
+    def _get_blocking_keys_worker(row_dict: Dict, col_analyses: Dict) -> List[str]:
+        keys = []
+        for (col1, col2), _ in col_analyses.items():
+            if col2 not in row_dict:
+                continue
+            value = str(row_dict[col2])
+            if not value or value == 'nan':
+                continue
+            value_lower = value.lower()
+            first_char = value_lower[0] if value_lower[0].isalnum() else '#'
+            keys.append(f"{col2}:first:{first_char}")
+            if len(value_lower) >= 2:
+                keys.append(f"{col2}:2gram:{value_lower[:2]}")
+            if len(value_lower) >= 3:
+                keys.append(f"{col2}:3gram:{value_lower[:3]}")
+                keys.append(f"{col2}:last3:{value_lower[-3:]}")
+        return keys if keys else []
+    
+    def _get_candidate_indices_worker(row_dict: Dict, idx1: int, blocking_idx: Dict) -> np.ndarray:
+        blocking_keys = _get_blocking_keys_worker(row_dict, column_analyses)
+        candidate_sets = []
+        for key in blocking_keys:
+            if key in blocking_idx:
+                arr = np.array(blocking_idx[key], dtype=np.int32)
+                candidate_sets.append(arr)
+        if not candidate_sets:
+            return np.array([], dtype=np.int32)
+        if len(candidate_sets) == 1:
+            return candidate_sets[0]
+        combined = np.concatenate(candidate_sets)
+        return np.unique(combined)
+    
+    for idx1 in chunk_indices:
+        row1_values = source1_data[idx1]
+        row1_dict = dict(zip(source1_cols, row1_values))
+        row1_series = pd.Series(row1_dict)
+        
+        candidate_indices = _get_candidate_indices_worker(row1_dict, idx1, blocking_index)
+        
+        if len(candidate_indices) == 0:
+            continue
+        
+        matches = []
+        best_match = None
+        best_score = 0.0
+        best_column_scores = {}
+        
+        for idx2 in candidate_indices:
+            row2_values = source2_data[idx2]
+            row2_dict = dict(zip(source2_cols, row2_values))
+            
+            total_score = 0.0
+            total_weight = 0.0
+            match_column_scores = {}
+            
+            for (col1, col2), analysis in column_analyses.items():
+                if col1 not in row1_dict or col2 not in row2_dict:
+                    continue
+                
+                val1 = row1_dict[col1]
+                val2 = row2_dict[col2]
+                
+                norm1_arr = source1_normalized.get(col1)
+                norm2_arr = source2_normalized.get(col2)
+                
+                if norm1_arr is not None:
+                    normalized_val1 = norm1_arr[idx1] if isinstance(norm1_arr, (list, np.ndarray)) else val1
+                else:
+                    normalized_val1 = val1
+                
+                if norm2_arr is not None:
+                    normalized_val2 = norm2_arr[idx2] if isinstance(norm2_arr, (list, np.ndarray)) else val2
+                else:
+                    normalized_val2 = val2
+                
+                if pd.isna(normalized_val1) or pd.isna(normalized_val2) or normalized_val1 == '' or normalized_val2 == '':
+                    score = 0.0
+                else:
+                    algorithm = analysis['algorithm']
+                    score = algorithm(str(normalized_val1), str(normalized_val2))
+                
+                weight = analysis.get('weight', 1.0)
+                total_score += score * weight
+                total_weight += weight
+                match_column_scores[col1] = score
+                
+                if early_termination and not return_all_matches:
+                    if total_weight > 0 and (total_score / total_weight) >= perfect_match_threshold:
+                        break
+            
+            if total_weight > 0:
+                overall_score = total_score / total_weight
+                
+                if early_termination and overall_score >= perfect_match_threshold:
+                    best_score = overall_score
+                    best_match = int(idx2)
+                    best_column_scores = match_column_scores
+                    break
+                
+                if return_all_matches:
+                    if overall_score >= lower_bound:
+                        matches.append({
+                            'idx2': int(idx2),
+                            'score': overall_score,
+                            'column_scores': match_column_scores.copy()
+                        })
+                else:
+                    if overall_score > best_score:
+                        best_score = overall_score
+                        best_match = int(idx2)
+                        best_column_scores = match_column_scores.copy()
+        
+        if return_all_matches:
+            for match in matches:
+                row2_values = source2_data[match['idx2']]
+                row2_dict = dict(zip(source2_cols, row2_values))
+                row2_series = pd.Series(row2_dict)
+                result = _create_result_worker(
+                    row1_series, row2_series, match['score'],
+                    match['column_scores'], idx1, match['idx2'],
+                    source1_cols, source2_cols, threshold, undecided_range
+                )
+                results.append(result)
+        elif best_match is not None:
+            row2_values = source2_data[best_match]
+            row2_dict = dict(zip(source2_cols, row2_values))
+            row2_series = pd.Series(row2_dict)
+            result = _create_result_worker(
+                row1_series, row2_series, best_score,
+                best_column_scores, idx1, best_match,
+                source1_cols, source2_cols, threshold, undecided_range
+            )
+            results.append(result)
+    
+    return results
+
+
+def _create_result_worker(
+    row1: pd.Series,
+    row2: pd.Series,
+    overall_score: float,
+    column_scores: Dict[str, float],
+    idx1: int,
+    idx2: int,
+    source1_cols: List[str],
+    source2_cols: List[str],
+    threshold: float,
+    undecided_range: float
+) -> Dict:
+    """Create result dictionary for a match (worker version)."""
+    result = {}
+    
+    for col in source1_cols:
+        result[f"source1_{col}"] = row1[col]
+    
+    for col in source2_cols:
+        result[f"source2_{col}"] = row2[col]
+    
+    for col, score in column_scores.items():
+        result[f"score_{col}"] = score
+    
+    result['overall_score'] = overall_score
+    
+    lower_bound = threshold - undecided_range
+    upper_bound = threshold + undecided_range
+    
+    if overall_score >= upper_bound:
+        result['match_result'] = 'accept'
+    elif overall_score <= lower_bound:
+        result['match_result'] = 'reject'
+    else:
+        result['match_result'] = 'undecided'
+    
+    result['source1_index'] = idx1
+    result['source2_index'] = idx2
+    
+    return result
 
 
 class FuzzyMatcher:
@@ -41,6 +242,8 @@ class FuzzyMatcher:
         self.num_workers = self.match_config.get('num_workers', min(cpu_count(), 8))
         self.chunk_size = self.match_config.get('chunk_size', 10000)
         self.use_multiprocessing = self.match_config.get('use_multiprocessing', True)
+        self.early_termination = self.match_config.get('early_termination', True)
+        self.perfect_match_threshold = self.match_config.get('perfect_match_threshold', 0.99)
         
         self._load_data()
         self._analyze_columns()
@@ -48,12 +251,14 @@ class FuzzyMatcher:
         self._create_blocking_index()
     
     def _load_data(self):
-        """Load data from both sources."""
+        """Load data from both sources with optimized chunking for large datasets."""
         mysql_creds = self.config.get('mysql_credentials')
         s3_creds = self.config.get('s3_credentials')
         
-        self.source1 = load_source(self.config['source1'], mysql_creds, s3_creds)
-        self.source2 = load_source(self.config['source2'], mysql_creds, s3_creds)
+        load_chunk_size = self.match_config.get('load_chunk_size', 100000)
+        
+        self.source1 = load_source(self.config['source1'], mysql_creds, s3_creds, chunk_size=load_chunk_size)
+        self.source2 = load_source(self.config['source2'], mysql_creds, s3_creds, chunk_size=load_chunk_size)
     
     def _analyze_columns(self):
         """Analyze columns and select algorithms."""
@@ -65,20 +270,18 @@ class FuzzyMatcher:
         )
     
     def _pre_normalize_data(self):
-        """Pre-normalize all data columns based on their types."""
+        """Pre-normalize all data columns based on their types using vectorized operations."""
         for (col1, col2), analysis in self.column_analyses.items():
             type1 = analysis['type1']
             type2 = analysis['type2']
             
             if col1 not in self.source1_normalized:
-                self.source1_normalized[col1] = self._normalize_column(
-                    self.source1[col1], type1
-                )
+                normalized = self._normalize_column(self.source1[col1], type1)
+                self.source1_normalized[col1] = normalized.values if isinstance(normalized, pd.Series) else normalized
             
             if col2 not in self.source2_normalized:
-                self.source2_normalized[col2] = self._normalize_column(
-                    self.source2[col2], type2
-                )
+                normalized = self._normalize_column(self.source2[col2], type2)
+                self.source2_normalized[col2] = normalized.values if isinstance(normalized, pd.Series) else normalized
     
     def _normalize_column(self, series: pd.Series, column_type: str) -> pd.Series:
         """Normalize an entire column vectorized."""
@@ -94,16 +297,28 @@ class FuzzyMatcher:
             return series
     
     def _create_blocking_index(self):
-        """Create enhanced blocking index with multiple strategies."""
+        """Create enhanced blocking index with multiple strategies using vectorized operations."""
         self.blocking_index = {}
         
-        for idx in tqdm(range(len(self.source2)), desc="Building blocking index", disable=len(self.source2) < 1000):
-            row = self.source2.iloc[idx]
-            blocking_keys = self._get_blocking_keys(row, idx)
+        size2 = len(self.source2)
+        if size2 == 0:
+            return
+        
+        source2_array = self.source2.values
+        source2_cols = list(self.source2.columns)
+        
+        for idx in tqdm(range(size2), desc="Building blocking index", disable=size2 < 1000):
+            row_values = source2_array[idx]
+            row_dict = dict(zip(source2_cols, row_values))
+            row_series = pd.Series(row_dict)
+            blocking_keys = self._get_blocking_keys(row_series, idx)
             for key in blocking_keys:
                 if key not in self.blocking_index:
                     self.blocking_index[key] = []
                 self.blocking_index[key].append(idx)
+        
+        for key in self.blocking_index:
+            self.blocking_index[key] = np.array(self.blocking_index[key], dtype=np.int32)
     
     def _get_blocking_keys(self, row: pd.Series, idx: int) -> List[str]:
         """Generate multiple blocking keys for a row using various strategies."""
@@ -151,22 +366,26 @@ class FuzzyMatcher:
         
         return keys if keys else [f'default:{idx % 100}']
     
-    def _get_candidate_indices(self, row: pd.Series, idx1: int) -> List[int]:
-        """Get candidate indices for matching using blocking."""
+    def _get_candidate_indices(self, row: pd.Series, idx1: int) -> np.ndarray:
+        """Get candidate indices for matching using blocking (returns numpy array for efficiency)."""
         blocking_keys = self._get_blocking_keys(row, idx1)
-        candidate_indices = set()
+        candidate_sets = []
         
         for key in blocking_keys:
             if key in self.blocking_index:
-                candidate_indices.update(self.blocking_index[key])
+                candidate_sets.append(self.blocking_index[key])
         
-        if not candidate_indices:
+        if not candidate_sets:
             size2 = len(self.source2)
             if size2 > 10000:
-                return []
-            return list(range(size2))
+                return np.array([], dtype=np.int32)
+            return np.arange(size2, dtype=np.int32)
         
-        return list(candidate_indices)
+        if len(candidate_sets) == 1:
+            return candidate_sets[0]
+        
+        combined = np.concatenate(candidate_sets)
+        return np.unique(combined)
     
     def _match_single_row(
         self,
@@ -254,11 +473,12 @@ class FuzzyMatcher:
         return results
     
     def _match_rows_parallel(self) -> List[Dict]:
-        """Match rows using parallel processing with threading."""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        """Match rows using parallel processing with multiprocessing for true parallelism."""
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        import pickle
         
         size1 = len(self.source1)
-        chunk_size = min(self.chunk_size, max(100, size1 // (self.num_workers * 4)))
+        chunk_size = min(self.chunk_size, max(1000, size1 // (self.num_workers * 2)))
         
         chunks = []
         for i in range(0, size1, chunk_size):
@@ -268,19 +488,26 @@ class FuzzyMatcher:
         results = []
         
         if self.use_multiprocessing and len(chunks) > 1 and self.num_workers > 1:
-            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-                future_to_chunk = {
-                    executor.submit(self._match_chunk, chunk): chunk 
-                    for chunk in chunks
-                }
+            try:
+                match_data = self._prepare_match_data_for_workers()
                 
-                completed = 0
-                with tqdm(total=len(chunks), desc="Matching chunks") as pbar:
-                    for future in as_completed(future_to_chunk):
-                        chunk_result = future.result()
-                        results.extend(chunk_result)
-                        completed += 1
-                        pbar.update(1)
+                with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
+                    future_to_chunk = {}
+                    for chunk in chunks:
+                        future = executor.submit(_match_chunk_worker, chunk, match_data)
+                        future_to_chunk[future] = chunk
+                    
+                    with tqdm(total=len(chunks), desc="Matching chunks") as pbar:
+                        for future in as_completed(future_to_chunk):
+                            try:
+                                chunk_result = future.result()
+                                results.extend(chunk_result)
+                            except Exception as e:
+                                print(f"Error in worker: {e}")
+                            pbar.update(1)
+            except Exception as e:
+                print(f"Multiprocessing failed, falling back to sequential: {e}")
+                return self._match_rows_sequential()
         else:
             chunk_results = [
                 self._match_chunk(chunk) 
@@ -291,8 +518,32 @@ class FuzzyMatcher:
         
         return results
     
-    def _match_chunk(self, chunk_indices: List[int]) -> List[Dict]:
-        """Match a chunk of rows from source1."""
+    def _prepare_match_data_for_workers(self) -> Dict:
+        """Prepare data structures for worker processes."""
+        return {
+            'source1_data': self.source1.values,
+            'source1_cols': list(self.source1.columns),
+            'source2_data': self.source2.values,
+            'source2_cols': list(self.source2.columns),
+            'source1_normalized': {k: (v.tolist() if isinstance(v, np.ndarray) else v) 
+                                  for k, v in self.source1_normalized.items()},
+            'source2_normalized': {k: (v.tolist() if isinstance(v, np.ndarray) else v) 
+                                  for k, v in self.source2_normalized.items()},
+            'column_analyses': self.column_analyses,
+            'blocking_index': {k: (v.tolist() if isinstance(v, np.ndarray) else v) 
+                             for k, v in self.blocking_index.items()},
+            'threshold': self.threshold,
+            'undecided_range': self.undecided_range,
+            'return_all_matches': self.return_all_matches,
+            'early_termination': self.early_termination,
+            'perfect_match_threshold': self.perfect_match_threshold
+        }
+    
+    def _match_chunk(self, chunk_indices: List[int], match_data: Optional[Dict] = None) -> List[Dict]:
+        """Match a chunk of rows from source1 with optimized data access."""
+        if match_data:
+            return _match_chunk_worker(chunk_indices, match_data)
+        
         results = []
         source1_cols = list(self.source1.columns)
         source2_cols = list(self.source2.columns)
@@ -307,7 +558,7 @@ class FuzzyMatcher:
             
             candidate_indices = self._get_candidate_indices(row1_series, idx1)
             
-            if not candidate_indices:
+            if len(candidate_indices) == 0:
                 continue
             
             matches = []
@@ -318,7 +569,6 @@ class FuzzyMatcher:
             for idx2 in candidate_indices:
                 row2_values = source2_array[idx2]
                 row2_dict = dict(zip(source2_cols, row2_values))
-                row2_series = pd.Series(row2_dict)
                 
                 total_score = 0.0
                 total_weight = 0.0
@@ -331,8 +581,18 @@ class FuzzyMatcher:
                     val1 = row1_dict[col1]
                     val2 = row2_dict[col2]
                     
-                    normalized_val1 = self.source1_normalized[col1].iloc[idx1] if col1 in self.source1_normalized else val1
-                    normalized_val2 = self.source2_normalized[col2].iloc[idx2] if col2 in self.source2_normalized else val2
+                    norm1_arr = self.source1_normalized.get(col1)
+                    norm2_arr = self.source2_normalized.get(col2)
+                    
+                    if norm1_arr is not None:
+                        normalized_val1 = norm1_arr[idx1] if isinstance(norm1_arr, np.ndarray) else norm1_arr.iloc[idx1]
+                    else:
+                        normalized_val1 = val1
+                    
+                    if norm2_arr is not None:
+                        normalized_val2 = norm2_arr[idx2] if isinstance(norm2_arr, np.ndarray) else norm2_arr.iloc[idx2]
+                    else:
+                        normalized_val2 = val2
                     
                     if pd.isna(normalized_val1) or pd.isna(normalized_val2) or normalized_val1 == '' or normalized_val2 == '':
                         score = 0.0
@@ -344,22 +604,32 @@ class FuzzyMatcher:
                     total_score += score * weight
                     total_weight += weight
                     match_column_scores[col1] = score
+                    
+                    if self.early_termination and not self.return_all_matches:
+                        if total_weight > 0 and (total_score / total_weight) >= self.perfect_match_threshold:
+                            break
                 
                 if total_weight > 0:
                     overall_score = total_score / total_weight
                     
+                    if self.early_termination and overall_score >= self.perfect_match_threshold:
+                        best_score = overall_score
+                        best_match = idx2
+                        best_column_scores = match_column_scores
+                        break
+                    
                     if self.return_all_matches:
                         if overall_score >= lower_bound:
                             matches.append({
-                                'idx2': idx2,
+                                'idx2': int(idx2),
                                 'score': overall_score,
-                                'column_scores': match_column_scores
+                                'column_scores': match_column_scores.copy()
                             })
                     else:
                         if overall_score > best_score:
                             best_score = overall_score
                             best_match = idx2
-                            best_column_scores = match_column_scores
+                            best_column_scores = match_column_scores.copy()
             
             if self.return_all_matches:
                 for match in matches:
@@ -377,14 +647,14 @@ class FuzzyMatcher:
                 row2_series = pd.Series(row2_dict)
                 result = self._create_result(
                     row1_series, row2_series, best_score, 
-                    best_column_scores, idx1, best_match
+                    best_column_scores, idx1, int(best_match)
                 )
                 results.append(result)
         
         return results
     
     def _match_rows_sequential(self) -> List[Dict]:
-        """Match rows sequentially using itertuples for speed."""
+        """Match rows sequentially with optimized data access."""
         results = []
         lower_bound = self.threshold - self.undecided_range
         source1_cols = list(self.source1.columns)
@@ -400,7 +670,7 @@ class FuzzyMatcher:
             
             candidate_indices = self._get_candidate_indices(row1_series, idx1)
             
-            if not candidate_indices:
+            if len(candidate_indices) == 0:
                 continue
             
             matches = []
@@ -411,7 +681,6 @@ class FuzzyMatcher:
             for idx2 in candidate_indices:
                 row2_values = source2_array[idx2]
                 row2_dict = dict(zip(source2_cols, row2_values))
-                row2_series = pd.Series(row2_dict)
                 
                 total_score = 0.0
                 total_weight = 0.0
@@ -424,8 +693,18 @@ class FuzzyMatcher:
                     val1 = row1_dict[col1]
                     val2 = row2_dict[col2]
                     
-                    normalized_val1 = self.source1_normalized[col1].iloc[idx1] if col1 in self.source1_normalized else val1
-                    normalized_val2 = self.source2_normalized[col2].iloc[idx2] if col2 in self.source2_normalized else val2
+                    norm1_arr = self.source1_normalized.get(col1)
+                    norm2_arr = self.source2_normalized.get(col2)
+                    
+                    if norm1_arr is not None:
+                        normalized_val1 = norm1_arr[idx1] if isinstance(norm1_arr, np.ndarray) else norm1_arr.iloc[idx1]
+                    else:
+                        normalized_val1 = val1
+                    
+                    if norm2_arr is not None:
+                        normalized_val2 = norm2_arr[idx2] if isinstance(norm2_arr, np.ndarray) else norm2_arr.iloc[idx2]
+                    else:
+                        normalized_val2 = val2
                     
                     if pd.isna(normalized_val1) or pd.isna(normalized_val2) or normalized_val1 == '' or normalized_val2 == '':
                         score = 0.0
@@ -437,22 +716,32 @@ class FuzzyMatcher:
                     total_score += score * weight
                     total_weight += weight
                     match_column_scores[col1] = score
+                    
+                    if self.early_termination and not self.return_all_matches:
+                        if total_weight > 0 and (total_score / total_weight) >= self.perfect_match_threshold:
+                            break
                 
                 if total_weight > 0:
                     overall_score = total_score / total_weight
                     
+                    if self.early_termination and overall_score >= self.perfect_match_threshold:
+                        best_score = overall_score
+                        best_match = idx2
+                        best_column_scores = match_column_scores
+                        break
+                    
                     if self.return_all_matches:
                         if overall_score >= lower_bound:
                             matches.append({
-                                'idx2': idx2,
+                                'idx2': int(idx2),
                                 'score': overall_score,
-                                'column_scores': match_column_scores
+                                'column_scores': match_column_scores.copy()
                             })
                     else:
                         if overall_score > best_score:
                             best_score = overall_score
                             best_match = idx2
-                            best_column_scores = match_column_scores
+                            best_column_scores = match_column_scores.copy()
             
             if self.return_all_matches:
                 for match in matches:
@@ -470,7 +759,7 @@ class FuzzyMatcher:
                 row2_series = pd.Series(row2_dict)
                 result = self._create_result(
                     row1_series, row2_series, best_score, 
-                    best_column_scores, idx1, best_match
+                    best_column_scores, idx1, int(best_match)
                 )
                 results.append(result)
         

@@ -1,0 +1,38 @@
+{
+  "source1": "data/products_master.csv",
+  "source2": "data/products_new.csv",
+  "output": "results/product_matches.csv",
+  "match_config": {
+    "columns": [
+      {
+        "source1": "product_name",
+        "source2": "name",
+        "weight": 0.3
+      },
+      {
+        "source1": "sku",
+        "source2": "product_sku",
+        "weight": 0.3
+      },
+      {
+        "source1": "description",
+        "source2": "product_description",
+        "weight": 0.2
+      },
+      {
+        "source1": "price",
+        "source2": "unit_price",
+        "weight": 0.1
+      },
+      {
+        "source1": "category",
+        "source2": "product_category",
+        "weight": 0.1
+      }
+    ],
+    "threshold": 0.80,
+    "undecided_range": 0.05,
+    "return_all_matches": false
+  }
+}
+

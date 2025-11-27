@@ -5,7 +5,10 @@ A configurable, high-performance fuzzy matching engine that can match rows betwe
 ## Features
 
 - **Automatic Algorithm Selection**: Detects column types (string, numeric, date, email, phone) and selects optimal matching algorithms
-- **Multiple Data Sources**: Supports CSV files and MySQL tables
+- **Multiple Data Sources**: Supports CSV files, MySQL tables, and S3 buckets
+- **Flexible Output**: Write results to CSV files, MySQL tables, or S3 buckets
+- **Environment Variables**: Secure credential management with `.env` file support
+- **IAM Role Support**: Automatic AWS IAM role detection for S3 operations
 - **Performance Optimized**: Uses `rapidfuzz` for fast string matching, blocking/indexing for large datasets
 - **Flexible Configuration**: Minimal config with auto-detection or full control with custom mappings
 - **Multi-column Matching**: Weighted scoring across multiple column pairs
@@ -39,13 +42,11 @@ python main.py --config config/example_config.json
 
 ## Configuration
 
-### Minimal Configuration (Auto-detection)
+For a complete configuration reference, see [CONFIGURATION.md](CONFIGURATION.md).
 
-The engine will automatically:
-- Detect CSV vs MySQL based on file extension
-- Match columns by name similarity
-- Detect column types and select algorithms
-- Use default threshold (0.85)
+### Quick Examples
+
+**Minimal Configuration (Auto-detection):**
 
 ```json
 {
@@ -55,7 +56,7 @@ The engine will automatically:
 }
 ```
 
-### With MySQL
+**With MySQL:**
 
 ```json
 {
@@ -71,7 +72,33 @@ The engine will automatically:
 }
 ```
 
-### Full Configuration
+**With Environment Variables:**
+
+```json
+{
+  "source1": "data/master.csv",
+  "source2": "data/new_records.csv",
+  "output": "match_results",
+  "mysql_credentials": {
+    "host": "${MYSQL_HOST:localhost}",
+    "user": "${MYSQL_USER}",
+    "password": "${MYSQL_PASSWORD}",
+    "database": "${MYSQL_DATABASE}"
+  }
+}
+```
+
+**S3 Output with IAM Role:**
+
+```json
+{
+  "source1": "data/master.csv",
+  "source2": "data/new_records.csv",
+  "output": "s3://my-bucket/results/matches.csv"
+}
+```
+
+**Full Configuration:**
 
 ```json
 {
@@ -92,10 +119,27 @@ The engine will automatically:
       }
     ],
     "threshold": 0.85,
-    "undecided_range": 0.05
+    "undecided_range": 0.05,
+    "return_all_matches": false
   }
 }
 ```
+
+### Supported Data Sources
+
+- **CSV Files**: Local file paths
+- **S3 Files**: `s3://bucket/key` URLs
+- **MySQL Tables**: Table names with credentials
+
+### Supported Output Destinations
+
+- **CSV Files**: Local file paths
+- **S3**: `s3://bucket/key` URLs (uses IAM role if credentials not provided)
+- **MySQL Tables**: Table names with credentials
+
+### Environment Variables
+
+Use `${VAR_NAME}` or `${VAR_NAME:default}` syntax to reference environment variables. See [CONFIGURATION.md](CONFIGURATION.md) for details.
 
 ## Algorithm Selection
 
@@ -182,6 +226,8 @@ match-engine/
 - `numpy>=1.24.0` - Numerical operations
 - `python-dateutil>=2.8.0` - Date parsing
 - `jsonschema>=4.0.0` - JSON config validation
+- `boto3>=1.28.0` - AWS S3 support
+- `python-dotenv>=1.0.0` - Environment variable support
 
 ## License
 

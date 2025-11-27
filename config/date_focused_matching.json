@@ -1,0 +1,28 @@
+{
+  "source1": "data/events_master.csv",
+  "source2": "data/events_new.csv",
+  "output": "results/event_matches.csv",
+  "match_config": {
+    "columns": [
+      {
+        "source1": "event_name",
+        "source2": "name",
+        "weight": 0.3
+      },
+      {
+        "source1": "event_date",
+        "source2": "date",
+        "weight": 0.4
+      },
+      {
+        "source1": "location",
+        "source2": "venue",
+        "weight": 0.3
+      }
+    ],
+    "threshold": 0.70,
+    "undecided_range": 0.10,
+    "return_all_matches": false
+  }
+}
+

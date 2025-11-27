@@ -1,0 +1,18 @@
+{
+  "source1": "data/contacts_master.csv",
+  "source2": "data/contacts_new.csv",
+  "output": "results/name_only_matches.csv",
+  "match_config": {
+    "columns": [
+      {
+        "source1": "contact_name",
+        "source2": "name",
+        "weight": 1.0
+      }
+    ],
+    "threshold": 0.75,
+    "undecided_range": 0.05,
+    "return_all_matches": false
+  }
+}
+

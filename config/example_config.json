@@ -1,0 +1,38 @@
+{
+  "source1": "data/master.csv",
+  "source2": "data/new_records.csv",
+  "output": "results/matches.csv",
+  "match_config": {
+    "columns": [
+      {
+        "source1": "name",
+        "source2": "full_name",
+        "weight": 0.3
+      },
+      {
+        "source1": "email",
+        "source2": "email_address",
+        "weight": 0.3
+      },
+      {
+        "source1": "phone",
+        "source2": "phone_number",
+        "weight": 0.2
+      },
+      {
+        "source1": "address",
+        "source2": "street_address",
+        "weight": 0.1
+      },
+      {
+        "source1": "dob",
+        "source2": "date_of_birth",
+        "weight": 0.1
+      }
+    ],
+    "threshold": 0.85,
+    "undecided_range": 0.05,
+    "return_all_matches": false
+  }
+}
+

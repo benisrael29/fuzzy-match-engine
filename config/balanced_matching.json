@@ -1,0 +1,43 @@
+{
+  "source1": "data/people_master.csv",
+  "source2": "data/people_new.csv",
+  "output": "results/balanced_matches.csv",
+  "match_config": {
+    "columns": [
+      {
+        "source1": "first_name",
+        "source2": "fname",
+        "weight": 0.15
+      },
+      {
+        "source1": "last_name",
+        "source2": "lname",
+        "weight": 0.15
+      },
+      {
+        "source1": "email",
+        "source2": "email_address",
+        "weight": 0.25
+      },
+      {
+        "source1": "phone",
+        "source2": "phone_number",
+        "weight": 0.15
+      },
+      {
+        "source1": "date_of_birth",
+        "source2": "dob",
+        "weight": 0.15
+      },
+      {
+        "source1": "address",
+        "source2": "street_address",
+        "weight": 0.15
+      }
+    ],
+    "threshold": 0.82,
+    "undecided_range": 0.06,
+    "return_all_matches": false
+  }
+}
+

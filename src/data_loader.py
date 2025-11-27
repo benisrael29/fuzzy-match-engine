@@ -33,7 +33,7 @@ def load_source(
         pandas DataFrame with normalized string columns
     """
     if isinstance(source, dict):
-        return _load_from_mysql_dict(source)
+        return _load_from_mysql_dict(source, chunk_size)
     
     if isinstance(source, str):
         if _is_s3_url(source):
@@ -141,18 +141,29 @@ def _get_s3_client(s3_credentials: Optional[Dict] = None):
 
 
 def _load_from_csv(file_path: str, chunk_size: Optional[int] = None) -> pd.DataFrame:
-    """Load data from CSV file."""
+    """Load data from CSV file with optimized memory usage for large files."""
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"CSV file not found: {file_path}")
     
     try:
+        file_size = os.path.getsize(file_path)
+        large_file_threshold = 500 * 1024 * 1024
+        
+        if chunk_size is None and file_size > large_file_threshold:
+            chunk_size = 50000
+        
         if chunk_size:
             chunks = []
-            for chunk in pd.read_csv(file_path, chunksize=chunk_size):
+            dtype_dict = {}
+            for i, chunk in enumerate(pd.read_csv(file_path, chunksize=chunk_size, low_memory=False)):
+                if i == 0:
+                    for col in chunk.columns:
+                        if chunk[col].dtype == 'object':
+                            dtype_dict[col] = 'string'
                 chunks.append(_normalize_dataframe(chunk))
             df = pd.concat(chunks, ignore_index=True)
         else:
-            df = pd.read_csv(file_path)
+            df = pd.read_csv(file_path, low_memory=False)
             df = _normalize_dataframe(df)
         
         return df
@@ -160,8 +171,8 @@ def _load_from_csv(file_path: str, chunk_size: Optional[int] = None) -> pd.DataF
         raise ValueError(f"Error reading CSV file {file_path}: {str(e)}")
 
 
-def _load_from_mysql(table_name: str, mysql_credentials: Dict) -> pd.DataFrame:
-    """Load data from MySQL table using SQLAlchemy."""
+def _load_from_mysql(table_name: str, mysql_credentials: Dict, chunk_size: Optional[int] = None) -> pd.DataFrame:
+    """Load data from MySQL table using SQLAlchemy with chunked reading for large tables."""
     required_keys = ['host', 'user', 'password', 'database']
     missing_keys = [key for key in required_keys if key not in mysql_credentials]
     
@@ -175,25 +186,31 @@ def _load_from_mysql(table_name: str, mysql_credentials: Dict) -> pd.DataFrame:
             f"{mysql_credentials['database']}"
         )
         
-        engine = create_engine(connection_string)
+        engine = create_engine(connection_string, pool_pre_ping=True)
         
         query = text(f"SELECT * FROM `{table_name}`")
-        df = pd.read_sql(query, engine)
         
-        df = _normalize_dataframe(df)
+        if chunk_size:
+            chunks = []
+            for chunk in pd.read_sql(query, engine, chunksize=chunk_size):
+                chunks.append(_normalize_dataframe(chunk))
+            df = pd.concat(chunks, ignore_index=True)
+        else:
+            df = pd.read_sql(query, engine)
+            df = _normalize_dataframe(df)
         
         return df
     except Exception as e:
         raise ValueError(f"Error connecting to MySQL table {table_name}: {str(e)}")
 
 
-def _load_from_mysql_dict(source: Dict) -> pd.DataFrame:
+def _load_from_mysql_dict(source: Dict, chunk_size: Optional[int] = None) -> pd.DataFrame:
     """Load data from MySQL using dict with connection details."""
     if 'table' not in source:
         raise ValueError("MySQL source dict must contain 'table' key")
     
     mysql_creds = {k: v for k, v in source.items() if k != 'table'}
-    return _load_from_mysql(source['table'], mysql_creds)
+    return _load_from_mysql(source['table'], mysql_creds, chunk_size)
 
 
 def _normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
