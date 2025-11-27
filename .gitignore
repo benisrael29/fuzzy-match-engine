@@ -42,6 +42,9 @@ results/
 .DS_Store
 Thumbs.db
 
+# Environment variables
+.env
+
 # other
 jobs/
 .pytest_cache/
