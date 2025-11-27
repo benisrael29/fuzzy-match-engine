@@ -88,18 +88,8 @@ def main():
         action='store_true',
         help='Launch interactive CLI job management UI'
     )
-    parser.add_argument(
-        '--gui',
-        action='store_true',
-        help='Launch visual GUI application'
-    )
     
     args = parser.parse_args()
-    
-    if args.gui or (not args.config and not args.setup and not args.ui):
-        from src.gui import run_gui
-        run_gui()
-        return
     
     if args.ui:
         from src.cli_ui import CLIUI
@@ -118,8 +108,7 @@ def main():
         print("  --config FILE    : Run with configuration file")
         print("  --setup          : Generate configuration template")
         print("  --ui             : Launch CLI job management UI")
-        print("  --gui            : Launch visual GUI application")
-        print("\nRunning without arguments launches GUI by default")
+        print("\nFor web service, use: python web_server.py")
         sys.exit(1)
     
     try:
