@@ -22,7 +22,12 @@ class JobQueue:
         Args:
             queue_file: Path to file for persisting queue state
         """
-        self.queue_file = queue_file
+        # Normalize path to handle both relative and absolute paths
+        if not os.path.isabs(queue_file):
+            # Relative path - ensure it's relative to current working directory
+            self.queue_file = os.path.normpath(queue_file)
+        else:
+            self.queue_file = queue_file
         self.lock = threading.Lock()
         
         # Priority queue: list of (priority, queued_at, job_name, job_data)
@@ -113,11 +118,14 @@ class JobQueue:
             
             # Create cancellation event
             self._cancel_events[job_name] = threading.Event()
-            
-            # Save state
+        
+        # Save state outside of lock to avoid blocking
+        try:
             self.save_state()
-            
-            return True
+        except Exception as e:
+            print(f"Warning: Failed to save queue state after enqueue: {e}")
+        
+        return True
     
     def dequeue(self) -> Optional[Dict[str, Any]]:
         """
@@ -138,11 +146,14 @@ class JobQueue:
             job_data["started_at"] = datetime.now().isoformat()
             job_data["message"] = "Job execution started"
             self._active_jobs[job_name] = job_data
-            
-            # Save state
+        
+        # Save state outside of lock to avoid blocking
+        try:
             self.save_state()
-            
-            return job_data
+        except Exception as e:
+            print(f"Warning: Failed to save queue state after dequeue: {e}")
+        
+        return job_data
     
     def cancel(self, job_name: str) -> bool:
         """
@@ -157,6 +168,7 @@ class JobQueue:
         Raises:
             ValueError: If job is not found or cannot be cancelled
         """
+        cancelled_from_queue = False
         with self.lock:
             # Check if job is in queue
             for i, (_, _, name, job_data) in enumerate(self._queue):
@@ -174,13 +186,11 @@ class JobQueue:
                     if job_name in self._cancel_events:
                         self._cancel_events[job_name].set()
                     
-                    # Save state
-                    self.save_state()
-                    
-                    return True
+                    cancelled_from_queue = True
+                    break
             
             # Check if job is running
-            if job_name in self._active_jobs:
+            if not cancelled_from_queue and job_name in self._active_jobs:
                 # Set cancellation event
                 if job_name in self._cancel_events:
                     self._cancel_events[job_name].set()
@@ -188,13 +198,18 @@ class JobQueue:
                 # Update status (will be moved to history when worker finishes)
                 self._active_jobs[job_name]["status"] = "cancelling"
                 self._active_jobs[job_name]["message"] = "Job cancellation requested"
-                
-                # Save state
-                self.save_state()
-                
-                return True
+                cancelled_from_queue = True
             
-            raise ValueError(f"Job '{job_name}' not found in queue or active jobs")
+            if not cancelled_from_queue:
+                raise ValueError(f"Job '{job_name}' not found in queue or active jobs")
+        
+        # Save state outside of lock to avoid blocking
+        try:
+            self.save_state()
+        except Exception as e:
+            print(f"Warning: Failed to save queue state after cancel: {e}")
+        
+        return True
     
     def get_status(self, job_name: str) -> Optional[Dict[str, Any]]:
         """
@@ -289,9 +304,12 @@ class JobQueue:
             # Clean up cancellation event
             if job_name in self._cancel_events:
                 del self._cancel_events[job_name]
-            
-            # Save state
+        
+        # Save state outside of lock to avoid blocking
+        try:
             self.save_state()
+        except Exception as e:
+            print(f"Warning: Failed to save queue state after mark_completed: {e}")
     
     def mark_cancelled(self, job_name: str, output: str = ""):
         """
@@ -318,9 +336,12 @@ class JobQueue:
             # Clean up cancellation event
             if job_name in self._cancel_events:
                 del self._cancel_events[job_name]
-            
-            # Save state
+        
+        # Save state outside of lock to avoid blocking
+        try:
             self.save_state()
+        except Exception as e:
+            print(f"Warning: Failed to save queue state after mark_cancelled: {e}")
     
     def is_cancelled(self, job_name: str) -> bool:
         """
@@ -353,8 +374,12 @@ class JobQueue:
     def save_state(self):
         """Save queue state to file."""
         try:
-            os.makedirs(os.path.dirname(self.queue_file), exist_ok=True)
+            # Create directory if needed
+            queue_dir = os.path.dirname(self.queue_file)
+            if queue_dir:  # Only create directory if path has a directory component
+                os.makedirs(queue_dir, exist_ok=True)
             
+            # Acquire lock only to read state, release before file I/O
             with self.lock:
                 state = {
                     "queue": [
@@ -379,6 +404,7 @@ class JobQueue:
                     "saved_at": datetime.now().isoformat()
                 }
             
+            # Write file outside of lock to avoid blocking
             with open(self.queue_file, 'w') as f:
                 json.dump(state, f, indent=2)
         except Exception as e:
@@ -469,6 +495,10 @@ class JobQueue:
                 
                 for job_name in to_remove:
                     del self._history[job_name]
-            
+        
+        # Save state outside of lock to avoid blocking
+        try:
             self.save_state()
+        except Exception as e:
+            print(f"Warning: Failed to save queue state after clear_history: {e}")
 
