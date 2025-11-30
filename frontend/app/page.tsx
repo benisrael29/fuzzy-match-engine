@@ -23,9 +23,15 @@ export default function JobsPage() {
       setLoading(true);
       setError(null);
       const data = await api.listJobs();
-      setJobs(data);
+      if (Array.isArray(data)) {
+        setJobs(data);
+      } else {
+        throw new Error('Invalid response format: expected array');
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load jobs');
+      const errorMessage = err instanceof Error ? err.message : 'Failed to load jobs';
+      setError(errorMessage);
+      console.error('Error fetching jobs:', err);
     } finally {
       setLoading(false);
     }
@@ -33,6 +39,7 @@ export default function JobsPage() {
 
   useEffect(() => {
     fetchJobs();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleDelete = async (name: string) => {

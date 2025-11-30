@@ -19,15 +19,26 @@ async def lifespan(app: FastAPI):
     global job_queue, worker_pool
     
     # Startup: Initialize queue and worker pool
-    job_queue = JobQueue()
-    worker_pool = create_worker_pool(job_queue)
-    worker_pool.start()
+    try:
+        job_queue = JobQueue()
+        worker_pool = create_worker_pool(job_queue)
+        worker_pool.start()
+    except Exception as e:
+        print(f"Error initializing job queue: {e}")
+        import traceback
+        traceback.print_exc()
+        # Continue without queue - endpoints will return 503
+        job_queue = None
+        worker_pool = None
     
     yield
     
     # Shutdown: Stop worker pool gracefully
     if worker_pool:
-        worker_pool.stop()
+        try:
+            worker_pool.stop()
+        except Exception as e:
+            print(f"Error stopping worker pool: {e}")
 
 
 app = FastAPI(
@@ -90,7 +101,7 @@ class QueueResponse(BaseModel):
     job_name: str
     status: str
     priority: str
-    queue_position: int
+    queue_position: Optional[int]
     queued_at: str
 
 
@@ -122,6 +133,16 @@ async def root():
     }
 
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "queue_initialized": job_queue is not None,
+        "worker_pool_running": worker_pool is not None and worker_pool.running if worker_pool else False
+    }
+
+
 @app.get("/api/jobs", response_model=List[JobListResponse])
 async def list_jobs():
     """List all jobs."""
@@ -130,6 +151,40 @@ async def list_jobs():
         return jobs
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing jobs: {str(e)}")
+
+
+@app.get("/api/jobs/queue", response_model=List[QueueResponse])
+async def list_queue():
+    """List all jobs in the queue."""
+    if not job_queue:
+        raise HTTPException(status_code=503, detail="Job queue not initialized")
+    
+    queued_jobs = job_queue.list_queue()
+    active_jobs = job_queue.list_active()
+    
+    result = []
+    
+    # Add queued jobs
+    for job in queued_jobs:
+        result.append({
+            "job_name": job["job_name"],
+            "status": job["status"],
+            "priority": job["priority"],
+            "queue_position": job["queue_position"],
+            "queued_at": job["queued_at"]
+        })
+    
+    # Add active jobs (no queue position)
+    for job in active_jobs:
+        result.append({
+            "job_name": job["job_name"],
+            "status": job["status"],
+            "priority": job["priority"],
+            "queue_position": None,
+            "queued_at": job["queued_at"]
+        })
+    
+    return result
 
 
 @app.get("/api/jobs/{name}", response_model=JobResponse)
@@ -299,40 +354,6 @@ async def get_job_status(name: str):
         "started_at": status_info.get("started_at"),
         "completed_at": status_info.get("completed_at")
     }
-
-
-@app.get("/api/jobs/queue", response_model=List[QueueResponse])
-async def list_queue():
-    """List all jobs in the queue."""
-    if not job_queue:
-        raise HTTPException(status_code=503, detail="Job queue not initialized")
-    
-    queued_jobs = job_queue.list_queue()
-    active_jobs = job_queue.list_active()
-    
-    result = []
-    
-    # Add queued jobs
-    for job in queued_jobs:
-        result.append({
-            "job_name": job["job_name"],
-            "status": job["status"],
-            "priority": job["priority"],
-            "queue_position": job["queue_position"],
-            "queued_at": job["queued_at"]
-        })
-    
-    # Add active jobs (no queue position)
-    for job in active_jobs:
-        result.append({
-            "job_name": job["job_name"],
-            "status": job["status"],
-            "priority": job["priority"],
-            "queue_position": None,
-            "queued_at": job["queued_at"]
-        })
-    
-    return result
 
 
 @app.post("/api/jobs/{name}/cancel")

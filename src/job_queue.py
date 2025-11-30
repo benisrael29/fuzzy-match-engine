@@ -39,7 +39,12 @@ class JobQueue:
         self._cancel_events: Dict[str, threading.Event] = {}
         
         # Load state from file if it exists
-        self.load_state()
+        # Wrap in try-except to prevent initialization failures
+        try:
+            self.load_state()
+        except Exception as e:
+            print(f"Warning: Failed to load queue state during initialization: {e}")
+            # Continue with empty queue
     
     def _get_priority_value(self, priority: str) -> int:
         """Convert priority string to integer value."""
@@ -386,9 +391,11 @@ class JobQueue:
             return
         
         try:
+            # Read file first, then acquire lock to minimize lock time
             with open(self.queue_file, 'r') as f:
                 state = json.load(f)
             
+            # Only acquire lock when actually modifying state
             with self.lock:
                 # Restore queue
                 self._queue = []
