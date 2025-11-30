@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import Image from 'next/image';
 import { Button } from '@/components/ui/button';
 import { Search, List } from 'lucide-react';
 import { ConnectionStatus } from '@/components/connection-status';
@@ -8,10 +9,14 @@ export function Header() {
     <header className="border-b bg-card">
       <div className="container mx-auto px-4 py-4">
         <div className="flex items-center justify-between">
-          <Link href="/" className="flex items-center gap-2">
-            <div className="h-8 w-8 rounded-lg bg-primary flex items-center justify-center">
-              <span className="text-primary-foreground font-bold text-lg">FM</span>
-            </div>
+          <Link href="/" className="flex items-center gap-3">
+            <Image
+              src="/logo.svg"
+              alt="Fuzzy Matching Engine"
+              width={32}
+              height={32}
+              className="h-8 w-8"
+            />
             <span className="text-xl font-semibold">Fuzzy Matching Engine</span>
           </Link>
           <div className="flex items-center gap-4">
