@@ -292,6 +292,7 @@ def _resolve_env_vars(obj: Any) -> Any:
         pattern = r'\$\{([^}:]+)(?::([^}]*))?\}'
         
         def replace_env_var(match):
+            import os
             var_name = match.group(1)
             default_value = match.group(2) if match.group(2) is not None else None
             env_value = os.getenv(var_name)
