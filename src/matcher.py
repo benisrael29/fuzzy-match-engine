@@ -3,6 +3,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional, Any, Union
 from multiprocessing import cpu_count, Manager, shared_memory, Value
 from functools import partial
+from collections import defaultdict
 import time
 from tqdm import tqdm
 from .data_loader import load_source
@@ -12,7 +13,12 @@ from .normalizers import (
     normalize_email,
     normalize_address,
     normalize_name,
-    normalize_string
+    normalize_string,
+    normalize_phone_vectorized,
+    normalize_email_vectorized,
+    normalize_address_vectorized,
+    normalize_name_vectorized,
+    normalize_string_vectorized
 )
 
 _WORKER_SHARED_CACHE: Dict[str, Tuple[shared_memory.SharedMemory, np.ndarray]] = {}
@@ -81,7 +87,13 @@ def _match_chunk_worker(chunk_indices: List[int], match_data: Dict) -> List[Dict
         key_groups = []
         for key in blocking_keys:
             if key in blocking_idx:
-                arr = np.array(blocking_idx[key], dtype=np.int32)
+                val = blocking_idx[key]
+                if isinstance(val, dict) and 'data' in val:
+                    arr = np.frombuffer(bytes(val['data']), dtype=np.dtype(val['dtype'])).reshape(val['shape']).copy()
+                elif isinstance(val, list):
+                    arr = np.array(val, dtype=np.int32)
+                else:
+                    arr = np.array(val, dtype=np.int32)
                 candidate_sets.append(arr)
                 key_groups.append(_parse_block_group_worker(key))
         if not candidate_sets:
@@ -374,6 +386,7 @@ class FuzzyMatcher:
         self._candidate_counter = None
         self._shared_memory_blocks: List[shared_memory.SharedMemory] = []
         self._shared_meta: Dict[str, Any] = {}
+        self._blocking_keys_cache: Dict[int, List[str]] = {}
         
         self._load_data()
         self._analyze_columns()
@@ -399,6 +412,26 @@ class FuzzyMatcher:
             self.source1 = load_source(self.config['source1'], mysql_creds, s3_creds, chunk_size=load_chunk_size)
         
         self.source2 = load_source(self.config['source2'], mysql_creds, s3_creds, chunk_size=load_chunk_size)
+        
+        self._optimize_dataframe_memory()
+    
+    def _optimize_dataframe_memory(self):
+        """Optimize DataFrame memory usage by converting to categorical where appropriate."""
+        max_categories = self.match_config.get('max_categories_for_categorical', 50)
+        
+        for df_name in ['source1', 'source2']:
+            df = getattr(self, df_name, None)
+            if df is None or df.empty:
+                continue
+            
+            for col in df.columns:
+                if df[col].dtype == 'object' or df[col].dtype.name == 'string':
+                    unique_count = df[col].nunique()
+                    if unique_count > 0 and unique_count <= max_categories and len(df) > 1000:
+                        try:
+                            df[col] = df[col].astype('category')
+                        except (ValueError, TypeError):
+                            pass
     
     def _analyze_columns(self):
         """Analyze columns and select algorithms."""
@@ -448,7 +481,13 @@ class FuzzyMatcher:
     def _df_to_shared_matrix(self, df: pd.DataFrame, label: str) -> Optional[Dict[str, Any]]:
         if df is None or df.empty:
             return None
-        safe_df = df.fillna('').astype(str)
+        
+        safe_df = df.copy()
+        for col in safe_df.columns:
+            if safe_df[col].dtype.name == 'category':
+                safe_df[col] = safe_df[col].astype(str)
+        
+        safe_df = safe_df.fillna('').astype(str)
         max_len = int(safe_df.apply(lambda col: col.str.len().max() or 1).max())
         max_len = max(1, max_len)
         dtype = f"<U{max_len}"
@@ -509,13 +548,13 @@ class FuzzyMatcher:
     def _normalize_column(self, series: pd.Series, column_type: str) -> pd.Series:
         """Normalize an entire column vectorized."""
         if column_type == 'phone':
-            return series.astype(str).apply(normalize_phone)
+            return normalize_phone_vectorized(series)
         elif column_type == 'email':
-            return series.astype(str).apply(normalize_email)
+            return normalize_email_vectorized(series)
         elif column_type == 'string_name':
-            return series.astype(str).apply(normalize_name)
+            return normalize_name_vectorized(series)
         elif 'address' in column_type.lower() or column_type == 'string_general':
-            return series.astype(str).apply(normalize_string)
+            return normalize_string_vectorized(series)
         else:
             return series
     
@@ -532,28 +571,31 @@ class FuzzyMatcher:
         if not blocking_columns:
             return
         
-        lower_cache = {
-            col: self.source2[col].astype(str).str.lower().fillna('') for col in blocking_columns
-        }
+        blocking_index_dict = defaultdict(list)
         
-        for idx in tqdm(range(size2), desc="Building blocking index", disable=size2 < 2000):
-            for col in blocking_columns:
-                value_lower = lower_cache[col].iat[idx]
-                if not value_lower or value_lower == 'nan':
-                    continue
+        for col in blocking_columns:
+            col_series = self.source2[col].astype(str).str.lower().fillna('')
+            valid_mask = (col_series != '') & (col_series != 'nan')
+            valid_indices = np.where(valid_mask)[0]
+            valid_values = col_series.iloc[valid_indices]
+            
+            if len(valid_values) == 0:
+                continue
+            
+            for idx, value_lower in zip(valid_indices, valid_values):
                 keys = self._generate_blocking_keys_for_value(col, value_lower)
                 for key in keys:
-                    bucket = self.blocking_index.setdefault(key, [])
-                    bucket.append(idx)
+                    blocking_index_dict[key].append(int(idx))
         
-        for key in list(self.blocking_index.keys()):
-            bucket = self.blocking_index[key]
+        if not blocking_index_dict:
+            return
+        
+        for key, bucket in tqdm(blocking_index_dict.items(), desc="Building blocking index", total=len(blocking_index_dict), disable=len(blocking_index_dict) < 2000):
             block_size = len(bucket)
             if block_size > self.blocking_stats['largest_block']:
                 self.blocking_stats['largest_block'] = block_size
             if self.max_block_size and block_size > self.max_block_size:
                 if self.skip_high_cardinality:
-                    del self.blocking_index[key]
                     self.blocking_stats['skipped_keys'] += 1
                     continue
                 bucket = bucket[:self.max_block_size]
@@ -619,7 +661,12 @@ class FuzzyMatcher:
     
     def _get_candidate_indices(self, row: pd.Series, idx1: int) -> np.ndarray:
         """Get candidate indices for matching using blocking (returns numpy array for efficiency)."""
-        blocking_keys = self._get_blocking_keys(row, idx1)
+        if idx1 in self._blocking_keys_cache:
+            blocking_keys = self._blocking_keys_cache[idx1]
+        else:
+            blocking_keys = self._get_blocking_keys(row, idx1)
+            self._blocking_keys_cache[idx1] = blocking_keys
+        
         candidate_sets = []
         key_groups = []
         
@@ -640,7 +687,19 @@ class FuzzyMatcher:
         return self._combine_candidate_sets(candidate_sets, key_groups)
 
     def _combine_candidate_sets(self, candidate_sets: List[np.ndarray], key_groups: List[str]) -> np.ndarray:
-        combined = np.unique(np.concatenate(candidate_sets))
+        total_size = sum(len(arr) for arr in candidate_sets)
+        
+        if total_size == 0:
+            return np.array([], dtype=np.int32)
+        
+        if total_size < 10000:
+            combined_set = set()
+            for arr in candidate_sets:
+                combined_set.update(arr.tolist())
+            combined = np.array(list(combined_set), dtype=np.int32)
+        else:
+            combined = np.unique(np.concatenate(candidate_sets))
+        
         if not self.max_candidates or len(combined) <= self.max_candidates:
             return combined
         self.candidate_stats['capped_rows'] = self.candidate_stats.get('capped_rows', 0) + 1
@@ -657,7 +716,16 @@ class FuzzyMatcher:
             filtered = [candidate_sets[idx] for idx, group in enumerate(key_groups) if group in allowed]
             if not filtered:
                 continue
-            merged = np.unique(np.concatenate(filtered))
+            
+            total_size = sum(len(arr) for arr in filtered)
+            if total_size < 10000:
+                merged_set = set()
+                for arr in filtered:
+                    merged_set.update(arr.tolist())
+                merged = np.array(list(merged_set), dtype=np.int32)
+            else:
+                merged = np.unique(np.concatenate(filtered))
+            
             if len(merged) <= self.max_candidates:
                 return merged
         return None
@@ -803,6 +871,17 @@ class FuzzyMatcher:
     
     def _prepare_match_data_for_workers(self) -> Dict:
         """Prepare data structures for worker processes."""
+        blocking_index_serialized = {}
+        for k, v in self.blocking_index.items():
+            if isinstance(v, np.ndarray):
+                blocking_index_serialized[k] = {
+                    'data': v.tobytes(),
+                    'dtype': str(v.dtype),
+                    'shape': v.shape
+                }
+            else:
+                blocking_index_serialized[k] = v
+        
         return {
             'source1_shared': self._shared_meta.get('source1'),
             'source1_cols': list(self.source1.columns),
@@ -811,8 +890,7 @@ class FuzzyMatcher:
             'source1_normalized_meta': self._shared_meta.get('source1_normalized', {}),
             'source2_normalized_meta': self._shared_meta.get('source2_normalized', {}),
             'column_analyses': self.column_analyses,
-            'blocking_index': {k: (v.tolist() if isinstance(v, np.ndarray) else v) 
-                             for k, v in self.blocking_index.items()},
+            'blocking_index': blocking_index_serialized,
             'threshold': self.threshold,
             'undecided_range': self.undecided_range,
             'return_all_matches': self.return_all_matches,

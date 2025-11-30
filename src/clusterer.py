@@ -12,7 +12,12 @@ from .normalizers import (
     normalize_email,
     normalize_address,
     normalize_name,
-    normalize_string
+    normalize_string,
+    normalize_phone_vectorized,
+    normalize_email_vectorized,
+    normalize_address_vectorized,
+    normalize_name_vectorized,
+    normalize_string_vectorized
 )
 
 
@@ -182,6 +187,22 @@ class Clusterer:
         
         self.source = load_source(self.config['source1'], mysql_creds, s3_creds, chunk_size=load_chunk_size)
     
+    def _optimize_dataframe_memory(self):
+        """Optimize DataFrame memory usage by converting to categorical where appropriate."""
+        max_categories = self.cluster_config.get('max_categories_for_categorical', 50)
+        
+        if self.source is None or self.source.empty:
+            return
+        
+        for col in self.source.columns:
+            if self.source[col].dtype == 'object' or self.source[col].dtype.name == 'string':
+                unique_count = self.source[col].nunique()
+                if unique_count > 0 and unique_count <= max_categories and len(self.source) > 1000:
+                    try:
+                        self.source[col] = self.source[col].astype('category')
+                    except (ValueError, TypeError):
+                        pass
+    
     def _analyze_columns(self):
         """Analyze columns and select algorithms."""
         column_mappings = self.cluster_config.get('columns')
@@ -223,13 +244,13 @@ class Clusterer:
     def _normalize_column(self, series: pd.Series, column_type: str) -> pd.Series:
         """Normalize an entire column vectorized."""
         if column_type == 'phone':
-            return series.astype(str).apply(normalize_phone)
+            return normalize_phone_vectorized(series)
         elif column_type == 'email':
-            return series.astype(str).apply(normalize_email)
+            return normalize_email_vectorized(series)
         elif column_type == 'string_name':
-            return series.astype(str).apply(normalize_name)
+            return normalize_name_vectorized(series)
         elif 'address' in column_type.lower() or column_type == 'string_general':
-            return series.astype(str).apply(normalize_string)
+            return normalize_string_vectorized(series)
         else:
             return series
     
@@ -318,26 +339,29 @@ class Clusterer:
         if not blocking_columns:
             return
         
-        lower_cache = {
-            col: self.source[col].astype(str).str.lower().fillna('') for col in blocking_columns
-        }
+        blocking_index_dict = defaultdict(list)
         
-        for idx in tqdm(range(size), desc="Building blocking index", disable=size < 2000):
-            for col in blocking_columns:
-                value_lower = lower_cache[col].iat[idx]
-                if not value_lower or value_lower == 'nan':
-                    continue
+        for col in blocking_columns:
+            col_series = self.source[col].astype(str).str.lower().fillna('')
+            valid_mask = (col_series != '') & (col_series != 'nan')
+            valid_indices = np.where(valid_mask)[0]
+            valid_values = col_series.iloc[valid_indices]
+            
+            if len(valid_values) == 0:
+                continue
+            
+            for idx, value_lower in zip(valid_indices, valid_values):
                 keys = self._generate_blocking_keys_for_value(col, value_lower)
                 for key in keys:
-                    bucket = self.blocking_index.setdefault(key, [])
-                    bucket.append(idx)
+                    blocking_index_dict[key].append(int(idx))
         
-        for key in list(self.blocking_index.keys()):
-            bucket = self.blocking_index[key]
+        if not blocking_index_dict:
+            return
+        
+        for key, bucket in tqdm(blocking_index_dict.items(), desc="Building blocking index", total=len(blocking_index_dict), disable=len(blocking_index_dict) < 2000):
             block_size = len(bucket)
             if self.max_block_size and block_size > self.max_block_size:
                 if self.skip_high_cardinality:
-                    del self.blocking_index[key]
                     continue
                 bucket = bucket[:self.max_block_size]
             self.blocking_index[key] = np.array(bucket, dtype=np.int32)

@@ -224,5 +224,21 @@ def _normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             df.loc[mask, col] = df.loc[mask, col].str.replace(r'\s+', ' ', regex=True)
             df.loc[~mask, col] = ''
     
+    return _optimize_dtypes(df)
+
+
+def _optimize_dtypes(df: pd.DataFrame, max_categories: int = 50) -> pd.DataFrame:
+    """Optimize DataFrame dtypes for memory efficiency."""
+    df = df.copy()
+    
+    for col in df.columns:
+        if df[col].dtype == 'object' or df[col].dtype.name == 'string':
+            unique_count = df[col].nunique()
+            if unique_count > 0 and unique_count <= max_categories and len(df) > 1000:
+                try:
+                    df[col] = df[col].astype('category')
+                except (ValueError, TypeError):
+                    pass
+    
     return df
 
