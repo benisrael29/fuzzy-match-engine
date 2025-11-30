@@ -1,15 +1,40 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Any, Optional, List
-import threading
-import io
-import sys
 from datetime import datetime
 from .job_manager import JobManager
-from .job_runner import JobRunner
+from .job_queue import JobQueue
+from .job_worker_pool import create_worker_pool, JobWorkerPool
 
-app = FastAPI(title="Fuzzy Matching Engine API", version="1.0.0")
+job_manager = JobManager()
+job_queue: Optional[JobQueue] = None
+worker_pool: Optional[JobWorkerPool] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan - startup and shutdown."""
+    global job_queue, worker_pool
+    
+    # Startup: Initialize queue and worker pool
+    job_queue = JobQueue()
+    worker_pool = create_worker_pool(job_queue)
+    worker_pool.start()
+    
+    yield
+    
+    # Shutdown: Stop worker pool gracefully
+    if worker_pool:
+        worker_pool.stop()
+
+
+app = FastAPI(
+    title="Fuzzy Matching Engine API",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,13 +43,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-job_manager = JobManager()
-job_runner = JobRunner()
-
-job_statuses: Dict[str, Dict[str, Any]] = {}
-job_outputs: Dict[str, str] = {}
-status_lock = threading.Lock()
 
 
 class JobCreateRequest(BaseModel):
@@ -57,6 +75,23 @@ class JobStatusResponse(BaseModel):
     status: str
     message: Optional[str] = None
     output: Optional[str] = None
+    queue_position: Optional[int] = None
+    priority: Optional[str] = None
+    queued_at: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+
+
+class QueueJobRequest(BaseModel):
+    priority: Optional[str] = "medium"
+
+
+class QueueResponse(BaseModel):
+    job_name: str
+    status: str
+    priority: str
+    queue_position: int
+    queued_at: str
 
 
 class SearchRequest(BaseModel):
@@ -79,6 +114,9 @@ async def root():
             "job_detail": "/api/jobs/{name}",
             "run_job": "/api/jobs/{name}/run",
             "job_status": "/api/jobs/{name}/status",
+            "queue": "/api/jobs/queue",
+            "cancel_job": "/api/jobs/{name}/cancel",
+            "queue_status": "/api/jobs/{name}/queue-status",
             "search": "/api/search"
         }
     }
@@ -160,13 +198,14 @@ async def update_job(name: str, request: JobUpdateRequest):
 async def delete_job(name: str):
     """Delete a job."""
     try:
-        job_manager.delete_job(name)
+        # Cancel job if it's queued or running
+        if job_queue:
+            try:
+                job_queue.cancel(name)
+            except ValueError:
+                pass  # Job not in queue, continue with deletion
         
-        with status_lock:
-            if name in job_statuses:
-                del job_statuses[name]
-            if name in job_outputs:
-                del job_outputs[name]
+        job_manager.delete_job(name)
         
         return {"message": f"Job '{name}' deleted successfully"}
     except FileNotFoundError:
@@ -175,48 +214,12 @@ async def delete_job(name: str):
         raise HTTPException(status_code=500, detail=f"Error deleting job: {str(e)}")
 
 
-def run_job_background(job_name: str, config: Dict[str, Any]):
-    """Run job in background thread and capture output."""
-    with status_lock:
-        job_statuses[job_name] = {
-            "status": "running",
-            "message": "Job execution started",
-            "started_at": datetime.now().isoformat()
-        }
-        job_outputs[job_name] = ""
-    
-    old_stdout = sys.stdout
-    sys.stdout = buffer = io.StringIO()
-    
-    try:
-        success = job_runner.run_job(config, job_name)
-        output = buffer.getvalue()
-        
-        with status_lock:
-            job_statuses[job_name] = {
-                "status": "completed" if success else "failed",
-                "message": "Job completed successfully" if success else "Job execution failed",
-                "completed_at": datetime.now().isoformat(),
-                "success": success
-            }
-            job_outputs[job_name] = output
-    except Exception as e:
-        output = buffer.getvalue() + f"\nError: {str(e)}"
-        with status_lock:
-            job_statuses[job_name] = {
-                "status": "failed",
-                "message": f"Job execution error: {str(e)}",
-                "completed_at": datetime.now().isoformat(),
-                "success": False
-            }
-            job_outputs[job_name] = output
-    finally:
-        sys.stdout = old_stdout
-
-
 @app.post("/api/jobs/{name}/run")
-async def run_job(name: str, background_tasks: BackgroundTasks):
-    """Execute a job."""
+async def run_job(name: str, request: Optional[QueueJobRequest] = None):
+    """Queue a job for execution."""
+    if not job_queue:
+        raise HTTPException(status_code=503, detail="Job queue not initialized")
+    
     try:
         job = job_manager.get_job(name)
     except FileNotFoundError:
@@ -224,32 +227,158 @@ async def run_job(name: str, background_tasks: BackgroundTasks):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error loading job: {str(e)}")
     
-    with status_lock:
-        if job_statuses.get(name, {}).get("status") == "running":
-            raise HTTPException(status_code=400, detail=f"Job '{name}' is already running")
+    # Check if job is already queued or running
+    status = job_queue.get_status(name)
+    if status:
+        current_status = status.get("status")
+        if current_status in ["queued", "running"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job '{name}' is already {current_status}"
+            )
     
-    background_tasks.add_task(run_job_background, name, job['config'])
+    # Get priority from request or default to medium
+    priority = "medium"
+    if request and request.priority:
+        priority = request.priority.lower()
+        if priority not in ["high", "medium", "low"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Priority must be 'high', 'medium', or 'low'"
+            )
     
-    return {
-        "message": f"Job '{name}' execution started",
-        "status": "running"
-    }
+    try:
+        job_queue.enqueue(name, job['config'], priority=priority)
+        queue_position = job_queue.get_queue_position(name)
+        
+        return {
+            "message": f"Job '{name}' queued successfully",
+            "status": "queued",
+            "priority": priority,
+            "queue_position": queue_position
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error queuing job: {str(e)}")
 
 
 @app.get("/api/jobs/{name}/status", response_model=JobStatusResponse)
 async def get_job_status(name: str):
     """Get job execution status."""
-    with status_lock:
-        status_info = job_statuses.get(name)
-        output = job_outputs.get(name)
+    if not job_queue:
+        raise HTTPException(status_code=503, detail="Job queue not initialized")
+    
+    status_info = job_queue.get_status(name)
     
     if status_info is None:
-        raise HTTPException(status_code=404, detail=f"No status found for job '{name}'. Job may not have been run yet.")
+        raise HTTPException(
+            status_code=404,
+            detail=f"No status found for job '{name}'. Job may not have been run yet."
+        )
+    
+    # Get output from worker pool if running, or from status if completed
+    output = ""
+    if status_info.get("status") == "running" and worker_pool:
+        output = worker_pool.get_output(name)
+    else:
+        output = status_info.get("output", "")
+    
+    # Get queue position if queued
+    queue_position = None
+    if status_info.get("status") == "queued":
+        queue_position = job_queue.get_queue_position(name)
     
     return {
-        "status": status_info["status"],
+        "status": status_info.get("status", "unknown"),
         "message": status_info.get("message"),
-        "output": output
+        "output": output,
+        "queue_position": queue_position,
+        "priority": status_info.get("priority"),
+        "queued_at": status_info.get("queued_at"),
+        "started_at": status_info.get("started_at"),
+        "completed_at": status_info.get("completed_at")
+    }
+
+
+@app.get("/api/jobs/queue", response_model=List[QueueResponse])
+async def list_queue():
+    """List all jobs in the queue."""
+    if not job_queue:
+        raise HTTPException(status_code=503, detail="Job queue not initialized")
+    
+    queued_jobs = job_queue.list_queue()
+    active_jobs = job_queue.list_active()
+    
+    result = []
+    
+    # Add queued jobs
+    for job in queued_jobs:
+        result.append({
+            "job_name": job["job_name"],
+            "status": job["status"],
+            "priority": job["priority"],
+            "queue_position": job["queue_position"],
+            "queued_at": job["queued_at"]
+        })
+    
+    # Add active jobs (no queue position)
+    for job in active_jobs:
+        result.append({
+            "job_name": job["job_name"],
+            "status": job["status"],
+            "priority": job["priority"],
+            "queue_position": None,
+            "queued_at": job["queued_at"]
+        })
+    
+    return result
+
+
+@app.post("/api/jobs/{name}/cancel")
+async def cancel_job(name: str):
+    """Cancel a queued or running job."""
+    if not job_queue:
+        raise HTTPException(status_code=503, detail="Job queue not initialized")
+    
+    try:
+        job_queue.cancel(name)
+        return {
+            "message": f"Job '{name}' cancellation requested",
+            "status": "cancelling"
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error cancelling job: {str(e)}")
+
+
+@app.get("/api/jobs/{name}/queue-status")
+async def get_queue_status(name: str):
+    """Get queue status for a specific job."""
+    if not job_queue:
+        raise HTTPException(status_code=503, detail="Job queue not initialized")
+    
+    status_info = job_queue.get_status(name)
+    
+    if status_info is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Job '{name}' not found in queue"
+        )
+    
+    queue_position = None
+    if status_info.get("status") == "queued":
+        queue_position = job_queue.get_queue_position(name)
+    
+    return {
+        "job_name": name,
+        "status": status_info.get("status"),
+        "priority": status_info.get("priority"),
+        "queue_position": queue_position,
+        "queued_at": status_info.get("queued_at"),
+        "started_at": status_info.get("started_at"),
+        "message": status_info.get("message")
     }
 
 

@@ -55,11 +55,11 @@ export default function JobsPage() {
 
   const handleRun = async (name: string) => {
     try {
-      await api.runJob(name);
-      toast(`Job "${name}" started successfully`, 'success');
+      const result = await api.runJob(name, 'medium');
+      toast(`Job "${name}" queued successfully${result.queue_position ? ` (position: ${result.queue_position})` : ''}`, 'success');
       window.location.href = `/jobs/${encodeURIComponent(name)}`;
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to run job';
+      const message = err instanceof Error ? err.message : 'Failed to queue job';
       toast(message, 'error');
     }
   };

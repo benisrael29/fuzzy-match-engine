@@ -1,5 +1,6 @@
 import re
 from typing import Optional
+from .nicknames import NICKNAME_MAP
 
 
 def normalize_phone(phone: str) -> str:
@@ -49,7 +50,7 @@ def normalize_address(address: str) -> str:
 
 
 def normalize_name(name: str) -> str:
-    """Normalize name by handling prefixes/suffixes and title case."""
+    """Normalize name by handling prefixes/suffixes, nicknames, and title case."""
     if not name or not isinstance(name, str):
         return ""
     
@@ -66,7 +67,12 @@ def normalize_name(name: str) -> str:
     if len(parts) > 1 and parts[-1] in suffixes:
         parts = parts[:-1]
     
-    normalized = ' '.join(parts)
+    expanded_parts = []
+    for part in parts:
+        expanded = NICKNAME_MAP.get(part, part)
+        expanded_parts.append(expanded)
+    
+    normalized = ' '.join(expanded_parts)
     normalized = normalized.title()
     
     return normalized

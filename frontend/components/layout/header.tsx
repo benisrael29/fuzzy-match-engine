@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import Image from 'next/image';
 import { Button } from '@/components/ui/button';
-import { Search, List } from 'lucide-react';
+import { Search, List, Clock } from 'lucide-react';
 import { ConnectionStatus } from '@/components/connection-status';
 
 export function Header() {
@@ -26,6 +26,12 @@ export function Header() {
                 <Link href="/">
                   <List className="h-4 w-4 mr-2" />
                   Jobs
+                </Link>
+              </Button>
+              <Button variant="ghost" asChild>
+                <Link href="/queue">
+                  <Clock className="h-4 w-4 mr-2" />
+                  Queue
                 </Link>
               </Button>
               <Button variant="ghost" asChild>

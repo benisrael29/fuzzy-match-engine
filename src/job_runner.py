@@ -1,6 +1,7 @@
 import sys
 import os
 import time
+import threading
 from typing import Dict, Any, Optional
 from pathlib import Path
 from .config_validator import validate_config
@@ -15,18 +16,28 @@ class JobRunner:
         """Initialize JobRunner."""
         pass
     
-    def run_job(self, config: Dict[str, Any], job_name: str = "") -> bool:
+    def run_job(
+        self,
+        config: Dict[str, Any],
+        job_name: str = "",
+        cancel_event: Optional[threading.Event] = None
+    ) -> bool:
         """
         Execute a matching job.
         
         Args:
             config: Job configuration dictionary
             job_name: Optional job name for display
+            cancel_event: Optional threading.Event to check for cancellation
         
         Returns:
             True if successful, False otherwise
         """
         try:
+            # Check for cancellation before starting
+            if cancel_event and cancel_event.is_set():
+                print("\n✗ Job cancelled before execution")
+                return False
             print("\n" + "=" * 60)
             if job_name:
                 print(f"RUNNING JOB: {job_name}")
@@ -66,6 +77,11 @@ class JobRunner:
             print("\n[3/4] Executing matching...")
             match_start_time = time.time()
             
+            # Check for cancellation before matching
+            if cancel_event and cancel_event.is_set():
+                print("\n✗ Job cancelled before matching")
+                return False
+            
             try:
                 use_streaming = total_comparisons > 10000000
                 if use_streaming:
@@ -73,6 +89,14 @@ class JobRunner:
                     results = matcher.match(stream_to_file=validated_config['output'])
                 else:
                     results = matcher.match()
+                
+                # Check for cancellation after matching
+                if cancel_event and cancel_event.is_set():
+                    print("\n✗ Job cancelled during matching")
+                    return False
+            except KeyboardInterrupt:
+                print("\n✗ Job cancelled by user")
+                return False
             except Exception as e:
                 print(f"✗ Error during matching: {e}")
                 import traceback
@@ -88,6 +112,11 @@ class JobRunner:
                 for result_type, count in distribution.items():
                     print(f"  {result_type}: {count:,}")
             
+            # Check for cancellation before writing
+            if cancel_event and cancel_event.is_set():
+                print("\n✗ Job cancelled before writing results")
+                return False
+            
             if not use_streaming:
                 print(f"\n[4/4] Writing results to {validated_config['output']}...")
                 write_start_time = time.time()
@@ -100,6 +129,11 @@ class JobRunner:
                     return False
             else:
                 print(f"✓ Results already streamed to {validated_config['output']}")
+            
+            # Final cancellation check
+            if cancel_event and cancel_event.is_set():
+                print("\n✗ Job cancelled")
+                return False
             
             print("\n" + "=" * 60)
             print("JOB COMPLETED SUCCESSFULLY")
