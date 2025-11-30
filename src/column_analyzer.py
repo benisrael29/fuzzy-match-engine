@@ -1,6 +1,6 @@
 import re
 import pandas as pd
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Any
 from dateutil import parser as date_parser
 from .algorithms import (
     levenshtein_similarity,

@@ -130,6 +130,7 @@ def validate_config_dict(config: Dict[str, Any]) -> Dict[str, Any]:
     Raises:
         ValueError: If configuration is invalid
     """
+    import os
     from jsonschema import validate, ValidationError, SchemaError
     from .config_validator import CONFIG_SCHEMA, _resolve_env_vars
     
@@ -150,7 +151,6 @@ def validate_config_dict(config: Dict[str, Any]) -> Dict[str, Any]:
     except SchemaError as e:
         raise ValueError(f"Configuration schema error: {str(e)}")
     
-    import os
     for source_key in ['source1', 'source2']:
         source = config.get(source_key)
         
