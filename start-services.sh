@@ -5,6 +5,9 @@ set -e
 echo "Starting Match Engine services..."
 echo ""
 
+# Create logs directory if it doesn't exist
+mkdir -p logs
+
 # Function to check if a port is in use
 check_port() {
     local port=$1
@@ -24,15 +27,15 @@ if check_port 8000; then
 else
     if [ -f "start-backend.py" ]; then
         if command -v python3 &> /dev/null; then
-            python3 start-backend.py > backend.log 2>&1 &
+            python3 start-backend.py > logs/backend.log 2>&1 &
             BACKEND_PID=$!
             echo "  ✓ Backend started (PID: $BACKEND_PID)"
-            echo "  ✓ Logs: backend.log"
+            echo "  ✓ Logs: logs/backend.log"
         elif command -v python &> /dev/null; then
-            python start-backend.py > backend.log 2>&1 &
+            python start-backend.py > logs/backend.log 2>&1 &
             BACKEND_PID=$!
             echo "  ✓ Backend started (PID: $BACKEND_PID)"
-            echo "  ✓ Logs: backend.log"
+            echo "  ✓ Logs: logs/backend.log"
         else
             echo "  ✗ Python not found. Please install Python 3."
             exit 1
@@ -68,11 +71,11 @@ else
         fi
         
         if command -v npm &> /dev/null; then
-            npm run dev > ../frontend.log 2>&1 &
+            npm run dev > ../logs/frontend.log 2>&1 &
             FRONTEND_PID=$!
             cd ..
             echo "  ✓ Frontend started (PID: $FRONTEND_PID)"
-            echo "  ✓ Logs: frontend.log"
+            echo "  ✓ Logs: logs/frontend.log"
         else
             echo "  ✗ npm not found. Please install Node.js and npm."
             cd ..
@@ -95,8 +98,8 @@ echo ""
 echo "Frontend UI:  http://localhost:3000"
 echo ""
 echo "Logs:"
-echo "  Backend:    backend.log"
-echo "  Frontend:   frontend.log"
+echo "  Backend:    logs/backend.log"
+echo "  Frontend:   logs/frontend.log"
 echo ""
 echo "To stop services, run: ./stop-services.sh"
 echo ""

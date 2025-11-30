@@ -1,6 +1,8 @@
 import sys
+import os
 import time
 from typing import Dict, Any, Optional
+from pathlib import Path
 from .config_validator import validate_config
 from .matcher import FuzzyMatcher
 from .output_writer import write_results
@@ -117,6 +119,47 @@ class JobRunner:
             return False
 
 
+def _get_project_root() -> Path:
+    """Find the project root directory (where start-backend.py is located)."""
+    # __file__ is src/job_runner.py, so go up to src/, then up to project root
+    src_dir = Path(__file__).resolve().parent  # src/ directory
+    project_root = src_dir.parent  # Project root (parent of src/)
+    
+    # Verify by checking for start-backend.py
+    if (project_root / 'start-backend.py').exists():
+        return project_root
+    
+    # Fallback: look for start-backend.py by going up the tree
+    current = src_dir
+    while current.parent != current:
+        if (current / 'start-backend.py').exists():
+            return current
+        current = current.parent
+    
+    # Final fallback: use current working directory
+    return Path.cwd()
+
+
+def _resolve_path(path: str, project_root: Path) -> str:
+    """
+    Resolve a file path relative to project root if it's a relative path.
+    
+    Args:
+        path: File path (can be absolute, relative, S3 URL, etc.)
+        project_root: Project root directory
+    
+    Returns:
+        Resolved absolute path (or original if S3 URL, MySQL table, etc.)
+    """
+    # Don't resolve S3 URLs, absolute paths, or non-CSV paths
+    if path.startswith('s3://') or os.path.isabs(path) or not path.endswith('.csv'):
+        return path
+    
+    # Resolve relative paths relative to project root
+    resolved = (project_root / path).resolve()
+    return str(resolved)
+
+
 def validate_config_dict(config: Dict[str, Any]) -> Dict[str, Any]:
     """
     Validate configuration dictionary (without file path) and resolve environment variables.
@@ -130,14 +173,15 @@ def validate_config_dict(config: Dict[str, Any]) -> Dict[str, Any]:
     Raises:
         ValueError: If configuration is invalid
     """
-    import os
     from jsonschema import validate, ValidationError, SchemaError
     from .config_validator import CONFIG_SCHEMA, _resolve_env_vars
     
     try:
         from dotenv import load_dotenv
-        if os.path.exists('.env'):
-            load_dotenv('.env')
+        project_root = _get_project_root()
+        env_file = project_root / '.env'
+        if env_file.exists():
+            load_dotenv(str(env_file))
     except ImportError:
         pass
     
@@ -151,6 +195,9 @@ def validate_config_dict(config: Dict[str, Any]) -> Dict[str, Any]:
     except SchemaError as e:
         raise ValueError(f"Configuration schema error: {str(e)}")
     
+    project_root = _get_project_root()
+    
+    # Resolve and validate source paths
     for source_key in ['source1', 'source2']:
         source = config.get(source_key)
         
@@ -158,11 +205,25 @@ def validate_config_dict(config: Dict[str, Any]) -> Dict[str, Any]:
             if not source.endswith('.csv'):
                 continue
             
-            if not os.path.exists(source):
+            resolved_path = _resolve_path(source, project_root)
+            config[source_key] = resolved_path
+            
+            if not os.path.exists(resolved_path):
                 raise ValueError(
                     f"CSV file not found: {source}\n"
+                    f"Resolved to: {resolved_path}\n"
                     f"Please check the path or use MySQL table name with mysql_credentials."
                 )
+    
+    # Resolve output path
+    output = config.get('output')
+    if isinstance(output, str) and output.endswith('.csv'):
+        resolved_output = _resolve_path(output, project_root)
+        config['output'] = resolved_output
+        # Create output directory if it doesn't exist
+        output_dir = os.path.dirname(resolved_output)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
     
     return config
 

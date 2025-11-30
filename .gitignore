@@ -30,6 +30,10 @@ jobs/*.json
 results/
 *.csv
 
+# Logs directory
+logs/
+*.log
+
 # IDE
 .vscode/
 .idea/
