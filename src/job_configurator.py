@@ -31,13 +31,22 @@ class JobConfigurator:
             return None
         
         description = self._get_job_description()
-        config = self._configure_sources()
+        mode = self._get_mode()
         
-        if not config:
-            return None
+        config = {'mode': mode}
         
-        config = self._configure_output(config)
-        config = self._configure_matching(config)
+        if mode == 'clustering':
+            config.update(self._configure_clustering_sources())
+            if not config.get('source1'):
+                return None
+            config = self._configure_output(config)
+            config = self._configure_clustering(config)
+        else:
+            config.update(self._configure_sources())
+            if not config:
+                return None
+            config = self._configure_output(config)
+            config = self._configure_matching(config)
         
         try:
             self.job_manager.save_job(name, description, config)
@@ -74,22 +83,35 @@ class JobConfigurator:
         
         config = job['config']
         
+        mode = config.get('mode', 'matching')
+        
         print("\n--- Source Configuration ---")
         edit_sources = input("Edit sources? (y/n) [n]: ").strip().lower()
         if edit_sources == 'y':
-            config = self._configure_sources()
-            if not config:
-                return False
+            if mode == 'clustering':
+                new_config = self._configure_clustering_sources()
+                config.update(new_config)
+            else:
+                new_config = self._configure_sources()
+                if not new_config:
+                    return False
+                config.update(new_config)
         
         print("\n--- Output Configuration ---")
         edit_output = input("Edit output settings? (y/n) [n]: ").strip().lower()
         if edit_output == 'y':
             config = self._configure_output(config)
         
-        print("\n--- Matching Configuration ---")
-        edit_matching = input("Edit matching settings? (y/n) [n]: ").strip().lower()
-        if edit_matching == 'y':
-            config = self._configure_matching(config)
+        if mode == 'clustering':
+            print("\n--- Clustering Configuration ---")
+            edit_clustering = input("Edit clustering settings? (y/n) [n]: ").strip().lower()
+            if edit_clustering == 'y':
+                config = self._configure_clustering(config)
+        else:
+            print("\n--- Matching Configuration ---")
+            edit_matching = input("Edit matching settings? (y/n) [n]: ").strip().lower()
+            if edit_matching == 'y':
+                config = self._configure_matching(config)
         
         try:
             self.job_manager.save_job(name, new_description, config, update_existing=True)
@@ -123,6 +145,32 @@ class JobConfigurator:
         """Get job description."""
         description = input("Job description (optional): ").strip()
         return description
+    
+    def _get_mode(self) -> str:
+        """Get operation mode (matching or clustering)."""
+        while True:
+            mode = input("\nOperation mode (matching/clustering) [matching]: ").strip().lower()
+            if not mode:
+                return 'matching'
+            if mode in ['matching', 'clustering']:
+                return mode
+            print("✗ Invalid mode. Use 'matching' or 'clustering'")
+    
+    def _configure_clustering_sources(self) -> Optional[Dict[str, Any]]:
+        """Configure data source for clustering."""
+        config = {}
+        
+        print("\n--- Source ---")
+        source1 = self._get_source("Source")
+        if not source1:
+            return None
+        config['source1'] = source1
+        
+        mysql_creds = self._get_mysql_credentials()
+        if mysql_creds:
+            config['mysql_credentials'] = mysql_creds
+        
+        return config
     
     def _configure_sources(self) -> Optional[Dict[str, Any]]:
         """Configure data sources."""
@@ -270,5 +318,54 @@ class JobConfigurator:
                 match_config['columns'] = columns
         
         config['match_config'] = match_config
+        return config
+    
+    def _configure_clustering(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Configure clustering parameters."""
+        print("\n--- Clustering Configuration ---")
+        
+        configure_advanced = input("Configure advanced clustering options? (y/n) [n]: ").strip().lower()
+        if configure_advanced != 'y':
+            return config
+        
+        cluster_config = {}
+        
+        threshold = input("Similarity threshold (0-1) [0.85]: ").strip()
+        if threshold:
+            try:
+                cluster_config['threshold'] = float(threshold)
+            except ValueError:
+                print("✗ Invalid threshold, using default 0.85")
+                cluster_config['threshold'] = 0.85
+        else:
+            cluster_config['threshold'] = 0.85
+        
+        generate_summary = input("Generate summary report? (y/n) [n]: ").strip().lower()
+        cluster_config['generate_summary'] = generate_summary == 'y'
+        
+        configure_columns = input("Configure column mappings? (y/n) [n]: ").strip().lower()
+        if configure_columns == 'y':
+            columns = []
+            print("\nEnter column mappings (press Enter with empty source1 to finish):")
+            while True:
+                source1_col = input("Column name: ").strip()
+                if not source1_col:
+                    break
+                
+                weight = input("Weight (0-1) [1.0]: ").strip()
+                try:
+                    weight_val = float(weight) if weight else 1.0
+                except ValueError:
+                    weight_val = 1.0
+                
+                columns.append({
+                    'source1': source1_col,
+                    'weight': weight_val
+                })
+            
+            if columns:
+                cluster_config['columns'] = columns
+        
+        config['cluster_config'] = cluster_config
         return config
 

@@ -225,20 +225,34 @@ class CLIUI:
                 print(f"Description: {job.get('description', 'No description')}")
                 print(f"Created: {job.get('created', 'Unknown')}")
                 print(f"Modified: {job.get('modified', 'Unknown')}")
+                mode = job['config'].get('mode', 'matching')
+                print(f"  Mode: {mode}")
                 print("\nConfiguration:")
                 print(f"  Source 1: {job['config'].get('source1', 'N/A')}")
-                print(f"  Source 2: {job['config'].get('source2', 'N/A')}")
+                if mode == 'matching':
+                    print(f"  Source 2: {job['config'].get('source2', 'N/A')}")
                 print(f"  Output: {job['config'].get('output', 'N/A')}")
                 
-                match_config = job['config'].get('match_config', {})
-                if match_config:
-                    print(f"  Threshold: {match_config.get('threshold', 'N/A')}")
-                    print(f"  Undecided Range: {match_config.get('undecided_range', 'N/A')}")
-                    columns = match_config.get('columns', [])
-                    if columns:
-                        print(f"  Column Mappings: {len(columns)}")
-                        for col in columns:
-                            print(f"    - {col.get('source1')} <-> {col.get('source2')} (weight: {col.get('weight', 1.0)})")
+                if mode == 'clustering':
+                    cluster_config = job['config'].get('cluster_config', {})
+                    if cluster_config:
+                        print(f"  Threshold: {cluster_config.get('threshold', 'N/A')}")
+                        print(f"  Generate Summary: {cluster_config.get('generate_summary', False)}")
+                        columns = cluster_config.get('columns', [])
+                        if columns:
+                            print(f"  Column Mappings: {len(columns)}")
+                            for col in columns:
+                                print(f"    - {col.get('source1')} (weight: {col.get('weight', 1.0)})")
+                else:
+                    match_config = job['config'].get('match_config', {})
+                    if match_config:
+                        print(f"  Threshold: {match_config.get('threshold', 'N/A')}")
+                        print(f"  Undecided Range: {match_config.get('undecided_range', 'N/A')}")
+                        columns = match_config.get('columns', [])
+                        if columns:
+                            print(f"  Column Mappings: {len(columns)}")
+                            for col in columns:
+                                print(f"    - {col.get('source1')} <-> {col.get('source2')} (weight: {col.get('weight', 1.0)})")
                 
                 print("-" * 60)
             else:

@@ -59,6 +59,16 @@ class JobStatusResponse(BaseModel):
     output: Optional[str] = None
 
 
+class SearchRequest(BaseModel):
+    master: str
+    query: Dict[str, Any]
+    threshold: Optional[float] = None
+    max_results: Optional[int] = None
+    config: Optional[str] = None
+    mysql_credentials: Optional[Dict[str, str]] = None
+    s3_credentials: Optional[Dict[str, str]] = None
+
+
 @app.get("/")
 async def root():
     return {
@@ -68,7 +78,8 @@ async def root():
             "jobs": "/api/jobs",
             "job_detail": "/api/jobs/{name}",
             "run_job": "/api/jobs/{name}/run",
-            "job_status": "/api/jobs/{name}/status"
+            "job_status": "/api/jobs/{name}/status",
+            "search": "/api/search"
         }
     }
 
@@ -240,4 +251,72 @@ async def get_job_status(name: str):
         "message": status_info.get("message"),
         "output": output
     }
+
+
+@app.post("/api/search")
+async def search(request: SearchRequest):
+    """
+    Search for matching records in the master dataset.
+    
+    Args:
+        request: Search request with master dataset path, query record, and optional parameters
+    
+    Returns:
+        List of matching records with scores
+    """
+    try:
+        from src.matcher import FuzzyMatcher
+        from src.config_validator import validate_config
+        
+        if request.config:
+            try:
+                job = job_manager.get_job(request.config)
+                config = job['config']
+            except FileNotFoundError:
+                config = validate_config(request.config)
+            
+            if config.get('mode') != 'search':
+                config['mode'] = 'search'
+            if 'source2' not in config:
+                config['source2'] = request.master
+            if request.threshold is not None:
+                if 'match_config' not in config:
+                    config['match_config'] = {}
+                config['match_config']['threshold'] = request.threshold
+                config['match_config']['return_all_matches'] = True
+            
+            if request.mysql_credentials:
+                config['mysql_credentials'] = request.mysql_credentials
+            if request.s3_credentials:
+                config['s3_credentials'] = request.s3_credentials
+            
+            matcher = FuzzyMatcher(config)
+        else:
+            threshold = request.threshold if request.threshold is not None else 0.85
+            matcher = FuzzyMatcher.create_search_matcher(
+                master_source=request.master,
+                query_record=request.query,
+                threshold=threshold,
+                mysql_credentials=request.mysql_credentials,
+                s3_credentials=request.s3_credentials
+            )
+        
+        results = matcher.search(
+            query_record=request.query,
+            threshold=request.threshold,
+            max_results=request.max_results
+        )
+        
+        return {
+            "matches": results,
+            "count": len(results),
+            "master_dataset": request.master
+        }
+        
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=f"File not found: {str(e)}")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Search error: {str(e)}")
 

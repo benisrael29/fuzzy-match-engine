@@ -189,3 +189,102 @@ def analyze_columns(
     
     return results
 
+
+def auto_detect_column_mappings(
+    query_record: Dict[str, Any],
+    master_df: pd.DataFrame
+) -> list:
+    """
+    Auto-detect column mappings between a query record and master dataset.
+    
+    Args:
+        query_record: Dictionary with query fields
+        master_df: Master dataset DataFrame
+    
+    Returns:
+        List of column mapping dicts with 'source1' and 'source2' keys
+    """
+    mappings = []
+    master_cols_lower = {col.lower(): col for col in master_df.columns}
+    
+    for query_key, query_value in query_record.items():
+        if query_value is None or (isinstance(query_value, str) and query_value.strip() == ''):
+            continue
+        
+        query_key_lower = query_key.lower()
+        
+        best_match = None
+        best_score = 0.0
+        
+        for master_col_lower, master_col in master_cols_lower.items():
+            if query_key_lower == master_col_lower:
+                best_match = master_col
+                best_score = 1.0
+                break
+            
+            if query_key_lower in master_col_lower or master_col_lower in query_key_lower:
+                score = len(set(query_key_lower) & set(master_col_lower)) / max(len(query_key_lower), len(master_col_lower))
+                if score > best_score:
+                    best_score = score
+                    best_match = master_col
+        
+        if best_match and best_score > 0.3:
+            mappings.append({
+                'source1': query_key,
+                'source2': best_match,
+                'weight': 1.0
+            })
+    
+    return mappings
+
+
+def analyze_query_columns(
+    query_record: Dict[str, Any],
+    master_df: pd.DataFrame,
+    column_mappings: Optional[list] = None
+) -> Dict[Tuple[str, str], Dict]:
+    """
+    Analyze column pairs between a query record and master dataset.
+    
+    Args:
+        query_record: Dictionary with query fields
+        master_df: Master dataset DataFrame
+        column_mappings: Optional list of dicts with 'source1' and 'source2' keys
+    
+    Returns:
+        Dict mapping (col1, col2) tuples to analysis results
+    """
+    query_df = pd.DataFrame([query_record])
+    
+    if column_mappings is None:
+        column_mappings = auto_detect_column_mappings(query_record, master_df)
+    
+    if not column_mappings:
+        return {}
+    
+    results = {}
+    
+    for mapping in column_mappings:
+        col1 = mapping.get('source1')
+        col2 = mapping.get('source2')
+        
+        if col1 not in query_df.columns:
+            continue
+        if col2 not in master_df.columns:
+            continue
+        
+        type1 = detect_column_type(query_df[col1], col1)
+        type2 = detect_column_type(master_df[col2], col2)
+        
+        column_type = type1 if type1 == type2 else 'string_general'
+        algorithm = select_algorithm(column_type)
+        
+        results[(col1, col2)] = {
+            'type1': type1,
+            'type2': type2,
+            'column_type': column_type,
+            'algorithm': algorithm,
+            'weight': mapping.get('weight', 1.0)
+        }
+    
+    return results

@@ -1,0 +1,20 @@
+{
+  "mode": "clustering",
+  "source1": "data/customers.csv",
+  "output": "results/clusters.csv",
+  "cluster_config": {
+    "threshold": 0.85,
+    "generate_summary": true,
+    "columns": [
+      {
+        "source1": "name",
+        "weight": 0.4
+      },
+      {
+        "source1": "email",
+        "weight": 0.6
+      }
+    ]
+  }
+}
+

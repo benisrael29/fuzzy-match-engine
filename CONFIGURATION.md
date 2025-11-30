@@ -11,27 +11,30 @@ This document provides a comprehensive reference for all configuration options a
 - [S3 Credentials](#s3-credentials)
 - [Environment Variables](#environment-variables)
 - [Match Configuration](#match-configuration)
+- [Clustering Configuration](#clustering-configuration)
 - [Complete Examples](#complete-examples)
 
 ## Basic Configuration
 
-Every configuration file requires three fields:
+Every configuration file requires at minimum `source1` and `output` fields. The `mode` field determines whether to perform matching (between two sources) or clustering (within a single source).
 
-```json
-{
-  "source1": "...",
-  "source2": "...",
-  "output": "..."
-}
-```
+### Operation Modes
+
+The engine supports two operation modes:
+
+- **matching** (default): Matches rows between two data sources (`source1` and `source2`)
+- **clustering**: Finds duplicates and groups similar records within a single data source (`source1` only)
 
 ### Required Fields
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `source1` | string or object | First data source (CSV file, S3 URL, or MySQL table) |
-| `source2` | string or object | Second data source (CSV file, S3 URL, or MySQL table) |
-| `output` | string or object | Output destination (CSV file, S3 URL, or MySQL table) |
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `mode` | string | No | Operation mode: `"matching"` (default) or `"clustering"` |
+| `source1` | string or object | Yes | First data source (CSV file, S3 URL, or MySQL table) |
+| `source2` | string or object | Yes* | Second data source (required for matching mode, not used in clustering) |
+| `output` | string or object | Yes | Output destination (CSV file, S3 URL, or MySQL table) |
+
+*`source2` is required when `mode` is `"matching"` (or omitted, as matching is the default). It is not used and should be omitted when `mode` is `"clustering"`.
 
 ## Data Sources
 
@@ -386,6 +389,106 @@ By default, the engine returns only the best match for each row in source1. Set 
   }
 }
 ```
+
+## Clustering Configuration
+
+The `cluster_config` section controls how clustering/duplicate finding is performed. Clustering mode finds duplicates and groups similar records within a single dataset.
+
+### Basic Clustering Config
+
+```json
+{
+  "mode": "clustering",
+  "source1": "data/customers.csv",
+  "output": "results/clusters.csv",
+  "cluster_config": {
+    "threshold": 0.85,
+    "generate_summary": false
+  }
+}
+```
+
+### Full Clustering Config
+
+```json
+{
+  "mode": "clustering",
+  "source1": "data/customers.csv",
+  "output": "results/clusters.csv",
+  "cluster_config": {
+    "columns": [
+      {
+        "source1": "name",
+        "weight": 0.4
+      },
+      {
+        "source1": "email",
+        "weight": 0.6
+      }
+    ],
+    "threshold": 0.85,
+    "generate_summary": true,
+    "use_blocking": true,
+    "use_multiprocessing": true,
+    "num_workers": 4
+  }
+}
+```
+
+### Cluster Config Fields
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `columns` | array | No | Auto-detect | Explicit column mappings with weights (only `source1` needed) |
+| `threshold` | number | No | 0.85 | Similarity threshold for clustering records (0-1) |
+| `generate_summary` | boolean | No | false | Generate summary report with cluster statistics |
+| `use_blocking` | boolean | No | true | Use blocking/indexing for performance optimization |
+| `use_multiprocessing` | boolean | No | true | Enable multi-process execution for parallel clustering |
+| `num_workers` | integer | No | min(cpu_count, 8) | Number of worker processes for parallel processing |
+| `chunk_size` | integer | No | 10000 | Number of record pairs per chunk for workers |
+| `load_chunk_size` | integer | No | 100000 | Chunk size for loading CSV/MySQL data |
+| `blocking_strategies` | array | No | `["first_char","three_gram","last_three"]` | Blocking strategies to use |
+| `max_block_size` | integer | No | null | Maximum records per blocking key |
+| `skip_high_cardinality` | boolean | No | true | Skip blocking keys exceeding max_block_size |
+
+### Clustering Column Mapping
+
+For clustering, column mappings only need `source1` (since we're working with a single dataset):
+
+```json
+{
+  "source1": "column_name",
+  "weight": 0.5
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `source1` | string | Yes | Column name in the data source |
+| `weight` | number | No | Weight for this column (default: 1.0) |
+
+**Note:** If `columns` is not specified, the engine will automatically:
+- Use all columns in the dataset
+- Detect column types and select appropriate algorithms
+- Assign equal weights to all columns
+
+### Clustering Output
+
+The clustering output includes:
+- All original columns from the source data
+- `cluster_id`: Unique identifier for each cluster (sequential integers starting from 0)
+- `cluster_size`: Number of records in the cluster
+
+Records with the same `cluster_id` are considered duplicates or similar records.
+
+### Summary Report
+
+When `generate_summary: true`, a summary report is generated (saved as `{output}_summary.txt`) containing:
+- Total records and total clusters
+- Number of singleton clusters (unique records)
+- Number of multi-record clusters (duplicates)
+- Cluster size distribution
+- Largest clusters (top 10)
 
 ## Complete Examples
 

@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Union
 from multiprocessing import cpu_count, Manager, shared_memory, Value
 from functools import partial
 import time
@@ -276,6 +276,67 @@ def _create_result_worker(
 class FuzzyMatcher:
     """Main fuzzy matching engine with performance optimizations."""
     
+    @classmethod
+    def create_search_matcher(
+        cls,
+        master_source: Union[str, Dict],
+        query_record: Dict[str, Any],
+        threshold: float = 0.85,
+        undecided_range: float = 0.05,
+        mysql_credentials: Optional[Dict] = None,
+        s3_credentials: Optional[Dict] = None,
+        column_mappings: Optional[List[Dict]] = None
+    ) -> 'FuzzyMatcher':
+        """
+        Create a FuzzyMatcher instance optimized for search with auto-detection.
+        
+        Args:
+            master_source: Path to master dataset (CSV, MySQL table, or S3 URL)
+            query_record: Dictionary with query fields
+            threshold: Match threshold
+            undecided_range: Undecided range
+            mysql_credentials: Optional MySQL credentials
+            s3_credentials: Optional S3 credentials
+            column_mappings: Optional explicit column mappings
+        
+        Returns:
+            FuzzyMatcher instance ready for search
+        """
+        from .column_analyzer import analyze_query_columns
+        
+        master_df = load_source(master_source, mysql_credentials, s3_credentials)
+        
+        if column_mappings is None:
+            from .column_analyzer import auto_detect_column_mappings
+            column_mappings = auto_detect_column_mappings(query_record, master_df)
+        
+        if not column_mappings:
+            raise ValueError("No column mappings found between query record and master dataset")
+        
+        query_df = pd.DataFrame([query_record])
+        column_analyses = analyze_query_columns(query_record, master_df, column_mappings)
+        
+        config = {
+            'source1': query_df,
+            'source2': master_source,
+            'output': 'search_results.csv',
+            'mode': 'search',
+            'match_config': {
+                'columns': column_mappings,
+                'threshold': threshold,
+                'undecided_range': undecided_range,
+                'return_all_matches': True
+            }
+        }
+        
+        if mysql_credentials:
+            config['mysql_credentials'] = mysql_credentials
+        if s3_credentials:
+            config['s3_credentials'] = s3_credentials
+        
+        matcher = cls(config)
+        return matcher
+    
     def __init__(self, config: Dict[str, Any]):
         """
         Initialize matcher with configuration.
@@ -327,7 +388,16 @@ class FuzzyMatcher:
         
         load_chunk_size = self.match_config.get('load_chunk_size', 100000)
         
-        self.source1 = load_source(self.config['source1'], mysql_creds, s3_creds, chunk_size=load_chunk_size)
+        mode = self.config.get('mode', 'matching')
+        
+        if mode == 'search':
+            if isinstance(self.config.get('source1'), pd.DataFrame):
+                self.source1 = self.config['source1']
+            else:
+                self.source1 = load_source(self.config.get('source1'), mysql_creds, s3_creds, chunk_size=load_chunk_size) if self.config.get('source1') else pd.DataFrame()
+        else:
+            self.source1 = load_source(self.config['source1'], mysql_creds, s3_creds, chunk_size=load_chunk_size)
+        
         self.source2 = load_source(self.config['source2'], mysql_creds, s3_creds, chunk_size=load_chunk_size)
     
     def _analyze_columns(self):
@@ -1018,6 +1088,174 @@ class FuzzyMatcher:
             return 'reject'
         else:
             return 'undecided'
+    
+    def search(
+        self,
+        query_record: Dict[str, Any],
+        threshold: Optional[float] = None,
+        max_results: Optional[int] = None
+    ) -> List[Dict]:
+        """
+        Search for matching records in the master dataset (source2) based on a query record.
+        
+        Args:
+            query_record: Dictionary with person details to search for
+            threshold: Optional match threshold (defaults to self.threshold)
+            max_results: Optional maximum number of results to return
+        
+        Returns:
+            List of matching records with scores, sorted by score (descending)
+        """
+        if threshold is None:
+            threshold = self.threshold
+        
+        lower_bound = threshold - self.undecided_range
+        
+        if not query_record:
+            return []
+        
+        query_series = pd.Series(query_record)
+        
+        query_normalized = {}
+        for (col1, col2), analysis in self.column_analyses.items():
+            if col1 in query_record:
+                val = query_record[col1]
+                if val is not None and not pd.isna(val):
+                    col_type = analysis.get('type1', 'string_general')
+                    normalized_val = self._normalize_single_value(val, col_type)
+                    query_normalized[col1] = normalized_val
+        
+        candidate_indices = self._get_candidate_indices_for_query(query_series, query_record)
+        
+        if len(candidate_indices) == 0:
+            return []
+        
+        matches = []
+        source2_array = self.source2.values
+        source2_cols = list(self.source2.columns)
+        
+        for idx2 in candidate_indices:
+            row2_values = source2_array[idx2]
+            row2_dict = dict(zip(source2_cols, row2_values))
+            row2_series = pd.Series(row2_dict)
+            
+            total_score = 0.0
+            total_weight = 0.0
+            match_column_scores = {}
+            
+            for (col1, col2), analysis in self.column_analyses.items():
+                if col1 not in query_record or col2 not in row2_dict:
+                    continue
+                
+                val1 = query_record[col1]
+                val2 = row2_dict[col2]
+                
+                normalized_val1 = query_normalized.get(col1)
+                if normalized_val1 is None:
+                    col_type = analysis.get('type1', 'string_general')
+                    normalized_val1 = self._normalize_single_value(val1, col_type) if val1 is not None else None
+                
+                normalized_val2 = self.source2_normalized[col2].iloc[idx2] if col2 in self.source2_normalized else val2
+                
+                if normalized_val1 is None or pd.isna(normalized_val1) or normalized_val1 == '':
+                    score = 0.0
+                elif pd.isna(normalized_val2) or normalized_val2 == '':
+                    score = 0.0
+                else:
+                    algorithm = analysis['algorithm']
+                    score = algorithm(str(normalized_val1), str(normalized_val2))
+                
+                weight = analysis.get('weight', 1.0)
+                total_score += score * weight
+                total_weight += weight
+                match_column_scores[col1] = score
+            
+            if total_weight > 0:
+                overall_score = total_score / total_weight
+                
+                if overall_score >= lower_bound:
+                    result = {
+                        'overall_score': overall_score,
+                        'match_result': self._classify_match(overall_score),
+                        'master_index': int(idx2)
+                    }
+                    
+                    for col in self.source2.columns:
+                        result[f"master_{col}"] = row2_dict[col]
+                    
+                    for col, score in match_column_scores.items():
+                        result[f"score_{col}"] = score
+                    
+                    for col, val in query_record.items():
+                        result[f"query_{col}"] = val
+                    
+                    matches.append(result)
+        
+        matches.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        if max_results is not None and max_results > 0:
+            matches = matches[:max_results]
+        
+        return matches
+    
+    def _normalize_single_value(self, value: Any, column_type: str) -> Any:
+        """Normalize a single value based on column type."""
+        if value is None or pd.isna(value):
+            return ''
+        
+        value_str = str(value)
+        
+        if column_type == 'phone':
+            return normalize_phone(value_str)
+        elif column_type == 'email':
+            return normalize_email(value_str)
+        elif column_type == 'string_name':
+            return normalize_name(value_str)
+        elif 'address' in column_type.lower() or column_type == 'string_general':
+            return normalize_string(value_str)
+        else:
+            return value_str
+    
+    def _get_candidate_indices_for_query(self, query_series: pd.Series, query_dict: Dict[str, Any]) -> np.ndarray:
+        """Get candidate indices for a query record using blocking."""
+        blocking_keys = []
+        
+        for (col1, col2), analysis in self.column_analyses.items():
+            if col1 not in query_dict:
+                continue
+            
+            value = str(query_dict[col1])
+            if not value or value == 'nan':
+                continue
+            
+            value_lower = value.lower()
+            keys = self._generate_blocking_keys_for_value(col2, value_lower)
+            blocking_keys.extend(keys)
+        
+        if not blocking_keys:
+            size2 = len(self.source2)
+            if size2 > 10000:
+                return np.array([], dtype=np.int32)
+            return np.arange(size2, dtype=np.int32)
+        
+        candidate_sets = []
+        key_groups = []
+        
+        for key in blocking_keys:
+            if key in self.blocking_index:
+                candidate_sets.append(self.blocking_index[key])
+                key_groups.append(self._parse_block_group(key))
+        
+        if not candidate_sets:
+            size2 = len(self.source2)
+            if size2 > 10000:
+                return np.array([], dtype=np.int32)
+            return np.arange(size2, dtype=np.int32)
+        
+        if len(candidate_sets) == 1 and not self.max_candidates:
+            return candidate_sets[0]
+        
+        return self._combine_candidate_sets(candidate_sets, key_groups)
     
     def match(self, stream_to_file: Optional[str] = None) -> pd.DataFrame:
         """

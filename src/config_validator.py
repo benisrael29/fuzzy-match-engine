@@ -13,8 +13,13 @@ except ImportError:
 
 CONFIG_SCHEMA = {
     "type": "object",
-    "required": ["source1", "source2", "output"],
+    "required": ["output"],
     "properties": {
+        "mode": {
+            "type": "string",
+            "enum": ["matching", "clustering", "search"],
+            "default": "matching"
+        },
         "source1": {
             "oneOf": [
                 {"type": "string"},
@@ -110,6 +115,59 @@ CONFIG_SCHEMA = {
                     "type": "boolean"
                 }
             }
+        },
+        "cluster_config": {
+            "type": "object",
+            "properties": {
+                "columns": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "source1": {"type": "string"},
+                            "weight": {"type": "number", "minimum": 0}
+                        },
+                        "required": ["source1"]
+                    }
+                },
+                "threshold": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                },
+                "generate_summary": {
+                    "type": "boolean"
+                },
+                "use_blocking": {
+                    "type": "boolean"
+                },
+                "use_multiprocessing": {
+                    "type": "boolean"
+                },
+                "num_workers": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "chunk_size": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "load_chunk_size": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "blocking_strategies": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                },
+                "max_block_size": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "skip_high_cardinality": {
+                    "type": "boolean"
+                }
+            }
         }
     }
 }
@@ -147,6 +205,24 @@ def validate_config(config_path: str, env_file: Optional[str] = None) -> Dict[st
     
     config = _resolve_env_vars(config)
     
+    mode = config.get('mode', 'matching')
+    
+    if mode == 'clustering':
+        if 'source2' in config:
+            raise ValueError("clustering mode does not require source2. Remove source2 from config.")
+        if 'source1' not in config:
+            raise ValueError("clustering mode requires source1. Add source1 to config.")
+    elif mode == 'search':
+        if 'source2' not in config:
+            raise ValueError("search mode requires source2 (master dataset). Add source2 to config.")
+        if 'source1' in config:
+            raise ValueError("search mode does not require source1. Remove source1 from config or set mode to 'matching'.")
+    else:
+        if 'source1' not in config:
+            raise ValueError("matching mode requires source1. Add source1 to config.")
+        if 'source2' not in config:
+            raise ValueError("matching mode requires source2. Add source2 to config or set mode to 'clustering' or 'search'.")
+    
     try:
         validate(instance=config, schema=CONFIG_SCHEMA)
     except ValidationError as e:
@@ -158,14 +234,22 @@ def validate_config(config_path: str, env_file: Optional[str] = None) -> Dict[st
     except SchemaError as e:
         raise ValueError(f"Configuration schema error: {str(e)}")
     
-    _validate_file_paths(config)
+    _validate_file_paths(config, mode)
     
     return config
 
 
-def _validate_file_paths(config: Dict[str, Any]):
+def _validate_file_paths(config: Dict[str, Any], mode: str = 'matching'):
     """Validate that CSV file paths exist (skip S3 URLs and MySQL tables)."""
-    for source_key in ['source1', 'source2']:
+    source_keys = []
+    if mode == 'matching':
+        source_keys = ['source1', 'source2']
+    elif mode == 'clustering':
+        source_keys = ['source1']
+    elif mode == 'search':
+        source_keys = ['source2']
+    
+    for source_key in source_keys:
         source = config.get(source_key)
         
         if isinstance(source, str):
