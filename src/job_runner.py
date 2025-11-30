@@ -6,7 +6,7 @@ from typing import Dict, Any, Optional
 from pathlib import Path
 from .config_validator import validate_config
 from .matcher import FuzzyMatcher
-from .output_writer import write_results
+from .output_writer import write_results, write_cluster_results, write_cluster_summary
 
 
 class JobRunner:
@@ -42,7 +42,11 @@ class JobRunner:
             if job_name:
                 print(f"RUNNING JOB: {job_name}")
             else:
-                print("RUNNING MATCHING JOB")
+                mode = config.get('mode', 'matching')
+                if mode == 'clustering':
+                    print("RUNNING CLUSTERING JOB")
+                else:
+                    print("RUNNING MATCHING JOB")
             print("=" * 60)
             
             print("\n[1/4] Validating configuration...")
@@ -53,6 +57,122 @@ class JobRunner:
                 return False
             print("✓ Configuration valid")
             
+            mode = validated_config.get('mode', 'matching')
+            
+            if mode == 'clustering':
+                return self._run_clustering_job(validated_config, cancel_event)
+            else:
+                return self._run_matching_job(validated_config, cancel_event)
+            
+        except KeyboardInterrupt:
+            print("\n\n✗ Job cancelled by user")
+            return False
+        except Exception as e:
+            print(f"\n✗ Unexpected error: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def _run_clustering_job(
+        self,
+        validated_config: Dict[str, Any],
+        cancel_event: Optional[threading.Event] = None
+    ) -> bool:
+        """Execute a clustering job."""
+        try:
+            from .clusterer import Clusterer
+            
+            print("\n[2/4] Loading data source...")
+            try:
+                clusterer = Clusterer(validated_config)
+            except Exception as e:
+                print(f"✗ Error loading data: {e}")
+                return False
+            
+            size = len(clusterer.source)
+            print(f"✓ Source: {size:,} rows")
+            print(f"✓ Columns to cluster: {len(clusterer.column_analyses)}")
+            
+            if clusterer.use_blocking:
+                print(f"ℹ Using blocking/indexing with {len(clusterer.blocking_index):,} keys")
+            
+            print(f"ℹ Using {clusterer.num_workers} worker(s) for processing")
+            
+            print("\n[3/4] Executing clustering...")
+            cluster_start_time = time.time()
+            
+            if cancel_event and cancel_event.is_set():
+                print("\n✗ Job cancelled before clustering")
+                return False
+            
+            try:
+                results = clusterer.cluster()
+                
+                if cancel_event and cancel_event.is_set():
+                    print("\n✗ Job cancelled during clustering")
+                    return False
+            except KeyboardInterrupt:
+                print("\n✗ Job cancelled by user")
+                return False
+            except Exception as e:
+                print(f"✗ Error during clustering: {e}")
+                import traceback
+                traceback.print_exc()
+                return False
+            
+            cluster_time = time.time() - cluster_start_time
+            print(f"✓ Found {len(results):,} clusters in {cluster_time:.2f} seconds")
+            
+            if cancel_event and cancel_event.is_set():
+                print("\n✗ Job cancelled before writing results")
+                return False
+            
+            print(f"\n[4/4] Writing results to {validated_config['output']}...")
+            write_start_time = time.time()
+            try:
+                write_cluster_results(results, validated_config['output'], config=validated_config)
+                write_time = time.time() - write_start_time
+                print(f"✓ Results written successfully in {write_time:.2f} seconds")
+            except Exception as e:
+                print(f"✗ Error writing results: {e}")
+                return False
+            
+            if validated_config.get('cluster_config', {}).get('generate_summary', False):
+                output_path = validated_config['output']
+                if isinstance(output_path, str) and output_path.endswith('.csv'):
+                    summary_path = output_path.replace('.csv', '_summary.txt')
+                elif isinstance(output_path, str):
+                    summary_path = output_path + '_summary.txt'
+                else:
+                    summary_path = 'results/cluster_summary.txt'
+                print(f"\nGenerating summary report to {summary_path}...")
+                write_cluster_summary(results, summary_path)
+            
+            if cancel_event and cancel_event.is_set():
+                print("\n✗ Job cancelled")
+                return False
+            
+            print("\n" + "=" * 60)
+            print("JOB COMPLETED SUCCESSFULLY")
+            print("=" * 60)
+            print(f"\nResults saved to: {validated_config['output']}")
+            print(f"Total clusters: {len(results)}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"\n✗ Unexpected error: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def _run_matching_job(
+        self,
+        validated_config: Dict[str, Any],
+        cancel_event: Optional[threading.Event] = None
+    ) -> bool:
+        """Execute a matching job."""
+        try:
             print("\n[2/4] Loading data sources...")
             try:
                 matcher = FuzzyMatcher(validated_config)
@@ -77,7 +197,6 @@ class JobRunner:
             print("\n[3/4] Executing matching...")
             match_start_time = time.time()
             
-            # Check for cancellation before matching
             if cancel_event and cancel_event.is_set():
                 print("\n✗ Job cancelled before matching")
                 return False
@@ -90,7 +209,6 @@ class JobRunner:
                 else:
                     results = matcher.match()
                 
-                # Check for cancellation after matching
                 if cancel_event and cancel_event.is_set():
                     print("\n✗ Job cancelled during matching")
                     return False
@@ -112,7 +230,6 @@ class JobRunner:
                 for result_type, count in distribution.items():
                     print(f"  {result_type}: {count:,}")
             
-            # Check for cancellation before writing
             if cancel_event and cancel_event.is_set():
                 print("\n✗ Job cancelled before writing results")
                 return False
@@ -130,7 +247,6 @@ class JobRunner:
             else:
                 print(f"✓ Results already streamed to {validated_config['output']}")
             
-            # Final cancellation check
             if cancel_event and cancel_event.is_set():
                 print("\n✗ Job cancelled")
                 return False
@@ -221,6 +337,25 @@ def validate_config_dict(config: Dict[str, Any]) -> Dict[str, Any]:
     
     config = _resolve_env_vars(config)
     
+    mode = config.get('mode', 'matching')
+    
+    # Mode-specific validation
+    if mode == 'clustering':
+        if 'source2' in config:
+            raise ValueError("clustering mode does not require source2. Remove source2 from config.")
+        if 'source1' not in config:
+            raise ValueError("clustering mode requires source1. Add source1 to config.")
+    elif mode == 'search':
+        if 'source2' not in config:
+            raise ValueError("search mode requires source2 (master dataset). Add source2 to config.")
+        if 'source1' in config:
+            raise ValueError("search mode does not require source1. Remove source1 from config or set mode to 'matching'.")
+    else:
+        if 'source1' not in config:
+            raise ValueError("matching mode requires source1. Add source1 to config.")
+        if 'source2' not in config:
+            raise ValueError("matching mode requires source2. Add source2 to config or set mode to 'clustering' or 'search'.")
+    
     try:
         validate(instance=config, schema=CONFIG_SCHEMA)
     except ValidationError as e:
@@ -231,8 +366,15 @@ def validate_config_dict(config: Dict[str, Any]) -> Dict[str, Any]:
     
     project_root = _get_project_root()
     
-    # Resolve and validate source paths
-    for source_key in ['source1', 'source2']:
+    # Resolve and validate source paths based on mode
+    if mode == 'clustering':
+        source_keys = ['source1']
+    elif mode == 'search':
+        source_keys = ['source2']
+    else:
+        source_keys = ['source1', 'source2']
+    
+    for source_key in source_keys:
         source = config.get(source_key)
         
         if isinstance(source, str):

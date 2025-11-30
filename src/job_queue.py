@@ -501,4 +501,3 @@ class JobQueue:
             self.save_state()
         except Exception as e:
             print(f"Warning: Failed to save queue state after clear_history: {e}")
-
