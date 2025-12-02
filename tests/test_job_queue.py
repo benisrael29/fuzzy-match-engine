@@ -220,15 +220,15 @@ class TestJobQueue(unittest.TestCase):
         results = []
         errors = []
         
-        def enqueue_jobs():
+        def enqueue_jobs(thread_id):
             try:
                 for i in range(10):
-                    self.queue.enqueue(f"job_{i}", config, priority="medium")
-                    results.append(f"enqueued_{i}")
+                    self.queue.enqueue(f"thread_{thread_id}_job_{i}", config, priority="medium")
+                    results.append(f"enqueued_{thread_id}_{i}")
             except Exception as e:
                 errors.append(str(e))
         
-        threads = [threading.Thread(target=enqueue_jobs) for _ in range(5)]
+        threads = [threading.Thread(target=enqueue_jobs, args=(i,)) for i in range(5)]
         for t in threads:
             t.start()
         for t in threads:

@@ -1,6 +1,6 @@
-from typing import Union, Optional, Tuple
+from typing import Union, Optional, Tuple, List
 from datetime import datetime
-from rapidfuzz import distance, fuzz
+from rapidfuzz import distance, fuzz, process
 from dateutil import parser as date_parser
 import re
 
@@ -289,4 +289,106 @@ def date_similarity(date1: Union[str, datetime], date2: Union[str, datetime]) ->
     
     # Use Levenshtein similarity as fallback
     return levenshtein_similarity(normalized1, normalized2) * 0.5
+
+
+def batch_levenshtein_similarity(queries: List[str], choices: List[str], batch_size: int = 1000) -> List[float]:
+    """
+    Calculate Levenshtein similarity for batches of string pairs.
+    
+    Args:
+        queries: List of query strings
+        choices: List of choice strings to compare against
+        batch_size: Number of comparisons per batch
+    
+    Returns:
+        List of similarity scores (0-1 scale)
+    """
+    if len(queries) != len(choices):
+        raise ValueError("queries and choices must have the same length")
+    
+    results = []
+    for i in range(0, len(queries), batch_size):
+        batch_queries = queries[i:i + batch_size]
+        batch_choices = choices[i:i + batch_size]
+        
+        batch_results = []
+        for q, c in zip(batch_queries, batch_choices):
+            if not q and not c:
+                batch_results.append(1.0)
+            elif not q or not c:
+                batch_results.append(0.0)
+            else:
+                batch_results.append(distance.Levenshtein.normalized_similarity(q, c))
+        
+        results.extend(batch_results)
+    
+    return results
+
+
+def batch_jaro_winkler_similarity(queries: List[str], choices: List[str], batch_size: int = 1000) -> List[float]:
+    """
+    Calculate Jaro-Winkler similarity for batches of string pairs.
+    
+    Args:
+        queries: List of query strings
+        choices: List of choice strings to compare against
+        batch_size: Number of comparisons per batch
+    
+    Returns:
+        List of similarity scores (0-1 scale)
+    """
+    if len(queries) != len(choices):
+        raise ValueError("queries and choices must have the same length")
+    
+    results = []
+    for i in range(0, len(queries), batch_size):
+        batch_queries = queries[i:i + batch_size]
+        batch_choices = choices[i:i + batch_size]
+        
+        batch_results = []
+        for q, c in zip(batch_queries, batch_choices):
+            if not q and not c:
+                batch_results.append(1.0)
+            elif not q or not c:
+                batch_results.append(0.0)
+            else:
+                batch_results.append(distance.JaroWinkler.normalized_similarity(q, c))
+        
+        results.extend(batch_results)
+    
+    return results
+
+
+def batch_token_set_ratio(queries: List[str], choices: List[str], batch_size: int = 1000) -> List[float]:
+    """
+    Calculate token set ratio for batches of string pairs.
+    
+    Args:
+        queries: List of query strings
+        choices: List of choice strings to compare against
+        batch_size: Number of comparisons per batch
+    
+    Returns:
+        List of similarity scores (0-1 scale)
+    """
+    if len(queries) != len(choices):
+        raise ValueError("queries and choices must have the same length")
+    
+    results = []
+    for i in range(0, len(queries), batch_size):
+        batch_queries = queries[i:i + batch_size]
+        batch_choices = choices[i:i + batch_size]
+        
+        batch_results = []
+        for q, c in zip(batch_queries, batch_choices):
+            if not q and not c:
+                batch_results.append(1.0)
+            elif not q or not c:
+                batch_results.append(0.0)
+            else:
+                batch_results.append(fuzz.token_set_ratio(q, c) / 100.0)
+        
+        results.extend(batch_results)
+    
+    return results
 

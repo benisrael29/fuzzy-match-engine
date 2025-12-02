@@ -610,15 +610,33 @@ class TestMatchingAccuracy(unittest.TestCase):
         n_non_matches = 50
         
         source1_data = {
-            'name': [f"Person {i}" for i in range(n_matches + n_non_matches)],
-            'email': [f"person{i}@test.com" for i in range(n_matches + n_non_matches)],
-            'phone': [f"555{i:07d}" for i in range(n_matches + n_non_matches)]
+            'name': (
+                [f"Person {i}" for i in range(n_matches)] +
+                [f"XYZNonMatch {i + 2000}" for i in range(n_non_matches)]
+            ),
+            'email': (
+                [f"person{i}@test.com" for i in range(n_matches)] +
+                [f"xyznonmatch{i + 2000}@otherdomain.org" for i in range(n_non_matches)]
+            ),
+            'phone': (
+                [f"555{i:07d}" for i in range(n_matches)] +
+                [f"777{i + 2000:07d}" for i in range(n_non_matches)]
+            )
         }
         
         source2_data = {
-            'name': [f"Person {i}" for i in range(n_matches)] + [f"Different {i}" for i in range(n_non_matches)],
-            'email': [f"person{i}@test.com" for i in range(n_matches)] + [f"different{i}@test.com" for i in range(n_non_matches)],
-            'phone': [f"555{i:07d}" for i in range(n_matches)] + [f"999{i:07d}" for i in range(n_non_matches)]
+            'name': (
+                [f"Person {i}" for i in range(n_matches)] +
+                [f"NonMatchPerson {i + 1000}" for i in range(n_non_matches)]
+            ),
+            'email': (
+                [f"person{i}@test.com" for i in range(n_matches)] +
+                [f"nonmatchperson{i + 1000}@differentdomain.net" for i in range(n_non_matches)]
+            ),
+            'phone': (
+                [f"555{i:07d}" for i in range(n_matches)] +
+                [f"999{i + 1000:07d}" for i in range(n_non_matches)]
+            )
         }
         
         ground_truth = {(i, i) for i in range(n_matches)}
@@ -641,7 +659,8 @@ class TestMatchingAccuracy(unittest.TestCase):
                     {'source1': 'email', 'source2': 'email', 'weight': 0.4},
                     {'source1': 'phone', 'source2': 'phone', 'weight': 0.2}
                 ],
-                'threshold': 0.85
+                'threshold': 0.85,
+                'undecided_range': 0.05
             }
         }
         

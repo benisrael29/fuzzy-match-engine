@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import warnings
 from typing import Dict, List, Tuple, Optional, Any, Union
 from multiprocessing import cpu_count, Manager, shared_memory, Value
 from functools import partial
@@ -19,6 +20,21 @@ from .normalizers import (
     normalize_address_vectorized,
     normalize_name_vectorized,
     normalize_string_vectorized
+)
+from .gpu_utils import (
+    detect_gpu,
+    get_gpu_memory_info,
+    should_use_gpu,
+    get_array_module,
+    to_gpu,
+    to_cpu,
+    check_gpu_memory_available,
+    clear_gpu_memory
+)
+from .algorithms import (
+    batch_levenshtein_similarity,
+    batch_jaro_winkler_similarity,
+    batch_token_set_ratio
 )
 
 _WORKER_SHARED_CACHE: Dict[str, Tuple[shared_memory.SharedMemory, np.ndarray]] = {}
@@ -199,7 +215,7 @@ def _match_chunk_worker(chunk_indices: List[int], match_data: Dict) -> List[Dict
             if total_weight > 0:
                 overall_score = total_score / total_weight
                 
-                if early_termination and overall_score >= perfect_match_threshold:
+                if early_termination and not return_all_matches and overall_score >= perfect_match_threshold:
                     best_score = overall_score
                     best_match = int(idx2)
                     best_column_scores = match_column_scores
@@ -387,12 +403,37 @@ class FuzzyMatcher:
         self._shared_memory_blocks: List[shared_memory.SharedMemory] = []
         self._shared_meta: Dict[str, Any] = {}
         self._blocking_keys_cache: Dict[int, List[str]] = {}
+        self._blocking_keys_precomputed: Optional[List[List[str]]] = None
+        
+        use_gpu_config = self.match_config.get('use_gpu', 'auto')
+        self.gpu_memory_limit = self.match_config.get('gpu_memory_limit')
+        self.gpu_batch_size = self.match_config.get('gpu_batch_size', 10000)
+        
+        dataset_size = len(self.config.get('source1', [])) if isinstance(self.config.get('source1'), (list, pd.DataFrame)) else 0
+        self.use_gpu = should_use_gpu(use_gpu_config, dataset_size)
+        
+        if self.use_gpu:
+            is_available, device_name = detect_gpu()
+            if is_available:
+                mem_info = get_gpu_memory_info()
+                if mem_info:
+                    free_mb, total_mb = mem_info
+                    print(f"GPU acceleration enabled: {device_name} ({free_mb}MB free / {total_mb}MB total)")
+                    if self.gpu_memory_limit and free_mb < self.gpu_memory_limit:
+                        warnings.warn(f"GPU free memory ({free_mb}MB) is less than requested limit ({self.gpu_memory_limit}MB)")
+                else:
+                    print(f"GPU acceleration enabled: {device_name}")
+            else:
+                self.use_gpu = False
+        
+        self.xp = get_array_module(self.use_gpu)
         
         self._load_data()
         self._analyze_columns()
         self._pre_normalize_data()
         self._initialize_shared_memory()
         self._create_blocking_index()
+        self._precompute_blocking_keys()
     
     def _load_data(self):
         """Load data from both sources with optimized chunking for large datasets."""
@@ -488,7 +529,12 @@ class FuzzyMatcher:
                 safe_df[col] = safe_df[col].astype(str)
         
         safe_df = safe_df.fillna('').astype(str)
-        max_len = int(safe_df.apply(lambda col: col.str.len().max() or 1).max())
+        # Vectorized max length calculation - compute max length per column, then overall max
+        max_len = 1
+        for col in safe_df.columns:
+            col_max = safe_df[col].str.len().max()
+            if pd.notna(col_max):
+                max_len = max(max_len, int(col_max))
         max_len = max(1, max_len)
         dtype = f"<U{max_len}"
         array = safe_df.to_numpy(dtype=dtype)
@@ -603,6 +649,21 @@ class FuzzyMatcher:
                 self.blocking_stats['trimmed_keys'] += 1
             self.blocking_index[key] = np.array(bucket, dtype=np.int32)
     
+    def _precompute_blocking_keys(self):
+        """Pre-compute blocking keys for all source1 rows to avoid repeated generation."""
+        if len(self.source1) == 0:
+            return
+        
+        # Pre-compute blocking keys for all source1 rows
+        source1_cols = list(self.source1.columns)
+        for idx1 in range(len(self.source1)):
+            if idx1 not in self._blocking_keys_cache:
+                row1_values = self.source1.values[idx1]
+                row1_dict = {col: row1_values[pos] for pos, col in enumerate(source1_cols)}
+                row1_series = pd.Series(row1_dict)
+                blocking_keys = self._get_blocking_keys(row1_series, idx1)
+                self._blocking_keys_cache[idx1] = blocking_keys
+    
     def _get_blocking_keys(self, row: pd.Series, idx: int) -> List[str]:
         """Generate multiple blocking keys for a row using various strategies."""
         keys = []
@@ -692,10 +753,31 @@ class FuzzyMatcher:
         if total_size == 0:
             return np.array([], dtype=np.int32)
         
-        if total_size < 10000:
+        # For small sets, use Python sets throughout (more efficient)
+        if total_size < 1000:
             combined_set = set()
             for arr in candidate_sets:
-                combined_set.update(arr.tolist())
+                # Direct iteration is faster than tolist() for small arrays
+                combined_set.update(arr)
+            combined = np.array(list(combined_set), dtype=np.int32)
+        elif self.use_gpu and total_size >= 1000:
+            try:
+                gpu_arrays = [to_gpu(arr, self.use_gpu) for arr in candidate_sets]
+                combined_gpu = self.xp.unique(self.xp.concatenate(gpu_arrays))
+                combined = to_cpu(combined_gpu)
+            except Exception as e:
+                warnings.warn(f"GPU operation failed, falling back to CPU: {e}")
+                if total_size < 10000:
+                    combined_set = set()
+                    for arr in candidate_sets:
+                        combined_set.update(arr)
+                    combined = np.array(list(combined_set), dtype=np.int32)
+                else:
+                    combined = np.unique(np.concatenate(candidate_sets))
+        elif total_size < 10000:
+            combined_set = set()
+            for arr in candidate_sets:
+                combined_set.update(arr)
             combined = np.array(list(combined_set), dtype=np.int32)
         else:
             combined = np.unique(np.concatenate(candidate_sets))
@@ -718,10 +800,52 @@ class FuzzyMatcher:
                 continue
             
             total_size = sum(len(arr) for arr in filtered)
-            if total_size < 10000:
+            
+            if self.use_gpu and total_size >= 1000:
+                estimated_memory_mb = (total_size * 4) // (1024 * 1024)
+                if check_gpu_memory_available(estimated_memory_mb, self.gpu_memory_limit):
+                    try:
+                        gpu_arrays = [to_gpu(arr, self.use_gpu) for arr in filtered]
+                        merged_gpu = self.xp.unique(self.xp.concatenate(gpu_arrays))
+                        merged = to_cpu(merged_gpu)
+                        del gpu_arrays, merged_gpu
+                    except Exception as e:
+                        warnings.warn(f"GPU operation failed, falling back to CPU: {e}")
+                        clear_gpu_memory()
+                        if total_size < 1000:
+                            merged_set = set()
+                            for arr in filtered:
+                                merged_set.update(arr)
+                            merged = np.array(list(merged_set), dtype=np.int32)
+                        elif total_size < 10000:
+                            merged_set = set()
+                            for arr in filtered:
+                                merged_set.update(arr)
+                            merged = np.array(list(merged_set), dtype=np.int32)
+                        else:
+                            merged = np.unique(np.concatenate(filtered))
+                else:
+                    if total_size < 1000:
+                        merged_set = set()
+                        for arr in filtered:
+                            merged_set.update(arr)
+                        merged = np.array(list(merged_set), dtype=np.int32)
+                    elif total_size < 10000:
+                        merged_set = set()
+                        for arr in filtered:
+                            merged_set.update(arr)
+                        merged = np.array(list(merged_set), dtype=np.int32)
+                    else:
+                        merged = np.unique(np.concatenate(filtered))
+            elif total_size < 1000:
                 merged_set = set()
                 for arr in filtered:
-                    merged_set.update(arr.tolist())
+                    merged_set.update(arr)
+                merged = np.array(list(merged_set), dtype=np.int32)
+            elif total_size < 10000:
+                merged_set = set()
+                for arr in filtered:
+                    merged_set.update(arr)
                 merged = np.array(list(merged_set), dtype=np.int32)
             else:
                 merged = np.unique(np.concatenate(filtered))
@@ -733,6 +857,122 @@ class FuzzyMatcher:
     def _parse_block_group(self, key: str) -> str:
         parts = key.split(':')
         return parts[1] if len(parts) > 1 else 'unknown'
+    
+    def _match_candidates_batch(
+        self, idx1: int, row1_dict: Dict, candidate_indices: np.ndarray,
+        source2_array: np.ndarray, source2_cols: List[str], lower_bound: float
+    ) -> Tuple[List[Dict], Optional[int], float, Dict]:
+        """
+        Match candidates in batch mode for better performance with many candidates.
+        
+        Returns:
+            Tuple of (matches, best_match, best_score, best_column_scores)
+        """
+        matches = []
+        best_match = None
+        best_score = 0.0
+        best_column_scores = {}
+        
+        batch_size = self.gpu_batch_size
+        
+        # Create column position map for source2 once
+        col2_to_pos = {col: i for i, col in enumerate(source2_cols)}
+        
+        for batch_start in range(0, len(candidate_indices), batch_size):
+            batch_end = min(batch_start + batch_size, len(candidate_indices))
+            batch_indices = candidate_indices[batch_start:batch_end]
+            
+            batch_scores = []
+            batch_column_scores = []
+            
+            for (col1, col2), analysis in self.column_analyses.items():
+                if col1 not in row1_dict:
+                    continue
+                
+                val1 = row1_dict[col1]
+                norm1_arr = self.source1_normalized.get(col1)
+                if norm1_arr is not None:
+                    normalized_val1 = norm1_arr[idx1] if isinstance(norm1_arr, np.ndarray) else norm1_arr.iloc[idx1]
+                else:
+                    normalized_val1 = val1
+                
+                if pd.isna(normalized_val1) or normalized_val1 == '':
+                    batch_column_scores.append([0.0] * len(batch_indices))
+                    continue
+                
+                norm2_arr = self.source2_normalized.get(col2)
+                batch_queries = [str(normalized_val1)] * len(batch_indices)
+                batch_choices = []
+                
+                for idx2 in batch_indices:
+                    row2_values = source2_array[idx2]
+                    if col2 not in col2_to_pos:
+                        batch_choices.append('')
+                        continue
+                    
+                    val2 = row2_values[col2_to_pos[col2]]
+                    if norm2_arr is not None:
+                        normalized_val2 = norm2_arr[idx2] if isinstance(norm2_arr, np.ndarray) else norm2_arr.iloc[idx2]
+                    else:
+                        normalized_val2 = val2
+                    
+                    if pd.isna(normalized_val2) or normalized_val2 == '':
+                        batch_choices.append('')
+                    else:
+                        batch_choices.append(str(normalized_val2))
+                
+                algorithm = analysis['algorithm']
+                algorithm_name = algorithm.__name__ if hasattr(algorithm, '__name__') else str(algorithm)
+                
+                if 'levenshtein' in algorithm_name.lower():
+                    scores = batch_levenshtein_similarity(batch_queries, batch_choices, batch_size=len(batch_choices))
+                elif 'jaro' in algorithm_name.lower():
+                    scores = batch_jaro_winkler_similarity(batch_queries, batch_choices, batch_size=len(batch_choices))
+                elif 'token' in algorithm_name.lower():
+                    scores = batch_token_set_ratio(batch_queries, batch_choices, batch_size=len(batch_choices))
+                else:
+                    scores = [algorithm(q, c) for q, c in zip(batch_queries, batch_choices)]
+                
+                batch_column_scores.append(scores)
+            
+            for i, idx2 in enumerate(batch_indices):
+                total_score = 0.0
+                total_weight = 0.0
+                match_column_scores = {}
+                
+                for j, ((col1, col2), analysis) in enumerate(self.column_analyses.items()):
+                    if col1 not in row1_dict:
+                        continue
+                    
+                    score = batch_column_scores[j][i] if j < len(batch_column_scores) else 0.0
+                    weight = analysis.get('weight', 1.0)
+                    total_score += score * weight
+                    total_weight += weight
+                    match_column_scores[col1] = score
+                
+                if total_weight > 0:
+                    overall_score = total_score / total_weight
+                    
+                    if self.early_termination and not self.return_all_matches and overall_score >= self.perfect_match_threshold:
+                        best_score = overall_score
+                        best_match = int(idx2)
+                        best_column_scores = match_column_scores
+                        return matches, best_match, best_score, best_column_scores
+                    
+                    if self.return_all_matches:
+                        if overall_score >= lower_bound:
+                            matches.append({
+                                'idx2': int(idx2),
+                                'score': overall_score,
+                                'column_scores': match_column_scores.copy()
+                            })
+                    else:
+                        if overall_score > best_score:
+                            best_score = overall_score
+                            best_match = int(idx2)
+                            best_column_scores = match_column_scores.copy()
+        
+        return matches, best_match, best_score, best_column_scores
     
     def _match_single_row(
         self,
@@ -913,15 +1153,36 @@ class FuzzyMatcher:
         source2_array = self.source2.values
         lower_bound = self.threshold - self.undecided_range
         
+        # Create column position maps for direct array access
+        col1_to_pos = {col: i for i, col in enumerate(source1_cols)}
+        col2_to_pos = {col: i for i, col in enumerate(source2_cols)}
+        
+        # Pre-calculate total weight for theoretical maximum score
+        total_possible_weight = sum(analysis.get('weight', 1.0) for (col1, col2), analysis in self.column_analyses.items() 
+                                   if col1 in col1_to_pos and col2 in col2_to_pos)
+        
         for idx1 in chunk_indices:
             row1_values = source1_array[idx1]
-            row1_dict = dict(zip(source1_cols, row1_values))
+            # Only create dict/Series when needed for _get_candidate_indices
+            row1_dict = {col: row1_values[pos] for pos, col in enumerate(source1_cols)}
             row1_series = pd.Series(row1_dict)
             
             candidate_indices = self._get_candidate_indices(row1_series, idx1)
             
             if len(candidate_indices) == 0:
                 continue
+            
+            # Pre-cache normalized values for row1 once per row
+            row1_normalized = {}
+            for (col1, col2), analysis in self.column_analyses.items():
+                if col1 not in col1_to_pos:
+                    continue
+                norm1_arr = self.source1_normalized.get(col1)
+                if norm1_arr is not None:
+                    row1_normalized[col1] = norm1_arr[idx1] if isinstance(norm1_arr, np.ndarray) else norm1_arr.iloc[idx1]
+                else:
+                    val1 = row1_values[col1_to_pos[col1]]
+                    row1_normalized[col1] = val1
             
             matches = []
             best_match = None
@@ -930,26 +1191,39 @@ class FuzzyMatcher:
             
             for idx2 in candidate_indices:
                 row2_values = source2_array[idx2]
-                row2_dict = dict(zip(source2_cols, row2_values))
                 
                 total_score = 0.0
                 total_weight = 0.0
                 match_column_scores = {}
+                remaining_weight = total_possible_weight
                 
                 for (col1, col2), analysis in self.column_analyses.items():
-                    if col1 not in row1_dict or col2 not in row2_dict:
+                    # Use direct array indexing instead of dictionary lookups
+                    if col1 not in col1_to_pos or col2 not in col2_to_pos:
                         continue
                     
-                    val1 = row1_dict[col1]
-                    val2 = row2_dict[col2]
+                    weight = analysis.get('weight', 1.0)
+                    remaining_weight -= weight
                     
-                    norm1_arr = self.source1_normalized.get(col1)
+                    # Use cached normalized value for row1
+                    normalized_val1 = row1_normalized.get(col1)
+                    if normalized_val1 is None:
+                        val1 = row1_values[col1_to_pos[col1]]
+                        norm1_arr = self.source1_normalized.get(col1)
+                        if norm1_arr is not None:
+                            normalized_val1 = norm1_arr[idx1] if isinstance(norm1_arr, np.ndarray) else norm1_arr.iloc[idx1]
+                        else:
+                            normalized_val1 = val1
+                        row1_normalized[col1] = normalized_val1
+                    
+                    val2 = row2_values[col2_to_pos[col2]]
+                    
                     norm2_arr = self.source2_normalized.get(col2)
                     
-                    if norm1_arr is not None:
-                        normalized_val1 = norm1_arr[idx1] if isinstance(norm1_arr, np.ndarray) else norm1_arr.iloc[idx1]
+                    if norm2_arr is not None:
+                        normalized_val2 = norm2_arr[idx2] if isinstance(norm2_arr, np.ndarray) else norm2_arr.iloc[idx2]
                     else:
-                        normalized_val1 = val1
+                        normalized_val2 = val2
                     
                     if norm2_arr is not None:
                         normalized_val2 = norm2_arr[idx2] if isinstance(norm2_arr, np.ndarray) else norm2_arr.iloc[idx2]
@@ -962,19 +1236,25 @@ class FuzzyMatcher:
                         algorithm = analysis['algorithm']
                         score = algorithm(str(normalized_val1), str(normalized_val2))
                     
-                    weight = analysis.get('weight', 1.0)
                     total_score += score * weight
                     total_weight += weight
                     match_column_scores[col1] = score
                     
+                    # Early termination: check if theoretical maximum is below threshold
                     if self.early_termination and not self.return_all_matches:
-                        if total_weight > 0 and (total_score / total_weight) >= self.perfect_match_threshold:
-                            break
+                        if total_weight > 0:
+                            current_score = total_score / total_weight
+                            # Theoretical max: assume all remaining columns score 1.0
+                            theoretical_max = (total_score + remaining_weight) / total_possible_weight if total_possible_weight > 0 else current_score
+                            if theoretical_max < self.threshold:
+                                break
+                            if current_score >= self.perfect_match_threshold:
+                                break
                 
                 if total_weight > 0:
                     overall_score = total_score / total_weight
                     
-                    if self.early_termination and overall_score >= self.perfect_match_threshold:
+                    if self.early_termination and not self.return_all_matches and overall_score >= self.perfect_match_threshold:
                         best_score = overall_score
                         best_match = idx2
                         best_column_scores = match_column_scores
@@ -1025,15 +1305,36 @@ class FuzzyMatcher:
         source1_array = self.source1.values
         source2_array = self.source2.values
         
+        # Create column position maps for direct array access
+        col1_to_pos = {col: i for i, col in enumerate(source1_cols)}
+        col2_to_pos = {col: i for i, col in enumerate(source2_cols)}
+        
+        # Pre-calculate total weight for theoretical maximum score
+        total_possible_weight = sum(analysis.get('weight', 1.0) for (col1, col2), analysis in self.column_analyses.items() 
+                                   if col1 in col1_to_pos and col2 in col2_to_pos)
+        
         for idx1 in tqdm(range(len(self.source1)), desc="Matching rows"):
             row1_values = source1_array[idx1]
-            row1_dict = dict(zip(source1_cols, row1_values))
+            # Only create dict/Series when needed for _get_candidate_indices
+            row1_dict = {col: row1_values[pos] for pos, col in enumerate(source1_cols)}
             row1_series = pd.Series(row1_dict)
             
             candidate_indices = self._get_candidate_indices(row1_series, idx1)
             
             if len(candidate_indices) == 0:
                 continue
+            
+            # Pre-cache normalized values for row1 once per row
+            row1_normalized = {}
+            for (col1, col2), analysis in self.column_analyses.items():
+                if col1 not in col1_to_pos:
+                    continue
+                norm1_arr = self.source1_normalized.get(col1)
+                if norm1_arr is not None:
+                    row1_normalized[col1] = norm1_arr[idx1] if isinstance(norm1_arr, np.ndarray) else norm1_arr.iloc[idx1]
+                else:
+                    val1 = row1_values[col1_to_pos[col1]]
+                    row1_normalized[col1] = val1
             
             matches = []
             best_match = None
@@ -1042,26 +1343,39 @@ class FuzzyMatcher:
             
             for idx2 in candidate_indices:
                 row2_values = source2_array[idx2]
-                row2_dict = dict(zip(source2_cols, row2_values))
                 
                 total_score = 0.0
                 total_weight = 0.0
                 match_column_scores = {}
+                remaining_weight = total_possible_weight
                 
                 for (col1, col2), analysis in self.column_analyses.items():
-                    if col1 not in row1_dict or col2 not in row2_dict:
+                    # Use direct array indexing instead of dictionary lookups
+                    if col1 not in col1_to_pos or col2 not in col2_to_pos:
                         continue
                     
-                    val1 = row1_dict[col1]
-                    val2 = row2_dict[col2]
+                    weight = analysis.get('weight', 1.0)
+                    remaining_weight -= weight
                     
-                    norm1_arr = self.source1_normalized.get(col1)
+                    # Use cached normalized value for row1
+                    normalized_val1 = row1_normalized.get(col1)
+                    if normalized_val1 is None:
+                        val1 = row1_values[col1_to_pos[col1]]
+                        norm1_arr = self.source1_normalized.get(col1)
+                        if norm1_arr is not None:
+                            normalized_val1 = norm1_arr[idx1] if isinstance(norm1_arr, np.ndarray) else norm1_arr.iloc[idx1]
+                        else:
+                            normalized_val1 = val1
+                        row1_normalized[col1] = normalized_val1
+                    
+                    val2 = row2_values[col2_to_pos[col2]]
+                    
                     norm2_arr = self.source2_normalized.get(col2)
                     
-                    if norm1_arr is not None:
-                        normalized_val1 = norm1_arr[idx1] if isinstance(norm1_arr, np.ndarray) else norm1_arr.iloc[idx1]
+                    if norm2_arr is not None:
+                        normalized_val2 = norm2_arr[idx2] if isinstance(norm2_arr, np.ndarray) else norm2_arr.iloc[idx2]
                     else:
-                        normalized_val1 = val1
+                        normalized_val2 = val2
                     
                     if norm2_arr is not None:
                         normalized_val2 = norm2_arr[idx2] if isinstance(norm2_arr, np.ndarray) else norm2_arr.iloc[idx2]
@@ -1074,19 +1388,25 @@ class FuzzyMatcher:
                         algorithm = analysis['algorithm']
                         score = algorithm(str(normalized_val1), str(normalized_val2))
                     
-                    weight = analysis.get('weight', 1.0)
                     total_score += score * weight
                     total_weight += weight
                     match_column_scores[col1] = score
                     
+                    # Early termination: check if theoretical maximum is below threshold
                     if self.early_termination and not self.return_all_matches:
-                        if total_weight > 0 and (total_score / total_weight) >= self.perfect_match_threshold:
-                            break
+                        if total_weight > 0:
+                            current_score = total_score / total_weight
+                            # Theoretical max: assume all remaining columns score 1.0
+                            theoretical_max = (total_score + remaining_weight) / total_possible_weight if total_possible_weight > 0 else current_score
+                            if theoretical_max < self.threshold:
+                                break
+                            if current_score >= self.perfect_match_threshold:
+                                break
                 
                 if total_weight > 0:
                     overall_score = total_score / total_weight
                     
-                    if self.early_termination and overall_score >= self.perfect_match_threshold:
+                    if self.early_termination and not self.return_all_matches and overall_score >= self.perfect_match_threshold:
                         best_score = overall_score
                         best_match = idx2
                         best_column_scores = match_column_scores
@@ -1212,21 +1532,22 @@ class FuzzyMatcher:
         source2_array = self.source2.values
         source2_cols = list(self.source2.columns)
         
+        # Create column position map for direct array access
+        col2_to_pos = {col: i for i, col in enumerate(source2_cols)}
+        
         for idx2 in candidate_indices:
             row2_values = source2_array[idx2]
-            row2_dict = dict(zip(source2_cols, row2_values))
-            row2_series = pd.Series(row2_dict)
             
             total_score = 0.0
             total_weight = 0.0
             match_column_scores = {}
             
             for (col1, col2), analysis in self.column_analyses.items():
-                if col1 not in query_record or col2 not in row2_dict:
+                if col1 not in query_record or col2 not in col2_to_pos:
                     continue
                 
                 val1 = query_record[col1]
-                val2 = row2_dict[col2]
+                val2 = row2_values[col2_to_pos[col2]]
                 
                 normalized_val1 = query_normalized.get(col1)
                 if normalized_val1 is None:
@@ -1258,8 +1579,12 @@ class FuzzyMatcher:
                         'master_index': int(idx2)
                     }
                     
+                    # Use direct array access instead of creating dict
                     for col in self.source2.columns:
-                        result[f"master_{col}"] = row2_dict[col]
+                        if col in col2_to_pos:
+                            result[f"master_{col}"] = row2_values[col2_to_pos[col]]
+                        else:
+                            result[f"master_{col}"] = None
                     
                     for col, score in match_column_scores.items():
                         result[f"score_{col}"] = score
@@ -1396,9 +1721,19 @@ class FuzzyMatcher:
                     results_written += 1
                     yield result
             else:
+                source1_cols = list(self.source1.columns)
+                source2_cols = list(self.source2.columns)
+                source1_array = self.source1.values
+                source2_array = self.source2.values
+                
+                # Create column position maps for direct array access
+                col1_to_pos = {col: i for i, col in enumerate(source1_cols)}
+                col2_to_pos = {col: i for i, col in enumerate(source2_cols)}
+                
                 for idx1 in tqdm(range(len(self.source1)), desc="Matching rows"):
-                    row1_values = self.source1.values[idx1]
-                    row1_dict = dict(zip(self.source1.columns, row1_values))
+                    row1_values = source1_array[idx1]
+                    # Only create dict/Series when needed for _get_candidate_indices
+                    row1_dict = {col: row1_values[pos] for pos, col in enumerate(source1_cols)}
                     row1_series = pd.Series(row1_dict)
                     
                     candidate_indices = self._get_candidate_indices(row1_series, idx1)
@@ -1409,24 +1744,21 @@ class FuzzyMatcher:
                     best_score = 0.0
                     best_column_scores = {}
                     lower_bound = self.threshold - self.undecided_range
-                    source2_array = self.source2.values
-                    source2_cols = list(self.source2.columns)
                     
                     for idx2 in candidate_indices:
                         row2_values = source2_array[idx2]
-                        row2_dict = dict(zip(source2_cols, row2_values))
-                        row2_series = pd.Series(row2_dict)
                         
                         total_score = 0.0
                         total_weight = 0.0
                         match_column_scores = {}
                         
                         for (col1, col2), analysis in self.column_analyses.items():
-                            if col1 not in row1_dict or col2 not in row2_dict:
+                            # Use direct array indexing instead of dictionary lookups
+                            if col1 not in col1_to_pos or col2 not in col2_to_pos:
                                 continue
                             
-                            val1 = row1_dict[col1]
-                            val2 = row2_dict[col2]
+                            val1 = row1_values[col1_to_pos[col1]]
+                            val2 = row2_values[col2_to_pos[col2]]
                             
                             normalized_val1 = self.source1_normalized[col1].iloc[idx1] if col1 in self.source1_normalized else val1
                             normalized_val2 = self.source2_normalized[col2].iloc[idx2] if col2 in self.source2_normalized else val2

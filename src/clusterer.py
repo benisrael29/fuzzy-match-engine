@@ -3,7 +3,9 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional, Any
 from multiprocessing import cpu_count, Manager, shared_memory, Value
 from functools import partial
+from collections import defaultdict
 import time
+import warnings
 from tqdm import tqdm
 from .data_loader import load_source
 from .column_analyzer import detect_column_type, select_algorithm
@@ -18,6 +20,21 @@ from .normalizers import (
     normalize_address_vectorized,
     normalize_name_vectorized,
     normalize_string_vectorized
+)
+from .gpu_utils import (
+    detect_gpu,
+    get_gpu_memory_info,
+    should_use_gpu,
+    get_array_module,
+    to_gpu,
+    to_cpu,
+    check_gpu_memory_available,
+    clear_gpu_memory
+)
+from .algorithms import (
+    batch_levenshtein_similarity,
+    batch_jaro_winkler_similarity,
+    batch_token_set_ratio
 )
 
 
@@ -171,6 +188,29 @@ class Clusterer:
         self._shared_memory_blocks: List[shared_memory.SharedMemory] = []
         self._shared_meta: Dict[str, Any] = {}
         
+        use_gpu_config = self.cluster_config.get('use_gpu', 'auto')
+        self.gpu_memory_limit = self.cluster_config.get('gpu_memory_limit')
+        self.gpu_batch_size = self.cluster_config.get('gpu_batch_size', 10000)
+        
+        dataset_size = len(self.config.get('source1', [])) if isinstance(self.config.get('source1'), (list, pd.DataFrame)) else 0
+        self.use_gpu = should_use_gpu(use_gpu_config, dataset_size)
+        
+        if self.use_gpu:
+            is_available, device_name = detect_gpu()
+            if is_available:
+                mem_info = get_gpu_memory_info()
+                if mem_info:
+                    free_mb, total_mb = mem_info
+                    print(f"GPU acceleration enabled: {device_name} ({free_mb}MB free / {total_mb}MB total)")
+                    if self.gpu_memory_limit and free_mb < self.gpu_memory_limit:
+                        warnings.warn(f"GPU free memory ({free_mb}MB) is less than requested limit ({self.gpu_memory_limit}MB)")
+                else:
+                    print(f"GPU acceleration enabled: {device_name}")
+            else:
+                self.use_gpu = False
+        
+        self.xp = get_array_module(self.use_gpu)
+        
         self._load_data()
         self._analyze_columns()
         self._pre_normalize_data()
@@ -275,7 +315,12 @@ class Clusterer:
         if df is None or df.empty:
             return None
         safe_df = df.fillna('').astype(str)
-        max_len = int(safe_df.apply(lambda col: col.str.len().max() or 1).max())
+        # Vectorized max length calculation - compute max length per column, then overall max
+        max_len = 1
+        for col in safe_df.columns:
+            col_max = safe_df[col].str.len().max()
+            if pd.notna(col_max):
+                max_len = max(max_len, int(col_max))
         max_len = max(1, max_len)
         dtype = f"<U{max_len}"
         array = safe_df.to_numpy(dtype=dtype)
@@ -422,7 +467,37 @@ class Clusterer:
             size = len(self.source)
             return np.arange(idx + 1, size, dtype=np.int32)
         
-        combined = np.unique(np.concatenate(candidate_sets))
+        total_size = sum(len(arr) for arr in candidate_sets)
+        
+        # For small sets, use Python sets throughout (more efficient)
+        if total_size < 1000:
+            combined_set = set()
+            for arr in candidate_sets:
+                # Direct iteration is faster than tolist() for small arrays
+                combined_set.update(arr)
+            combined = np.array(list(combined_set), dtype=np.int32)
+        elif self.use_gpu and total_size >= 1000:
+            try:
+                gpu_arrays = [to_gpu(arr, self.use_gpu) for arr in candidate_sets]
+                combined_gpu = self.xp.unique(self.xp.concatenate(gpu_arrays))
+                combined = to_cpu(combined_gpu)
+            except Exception as e:
+                warnings.warn(f"GPU operation failed, falling back to CPU: {e}")
+                if total_size < 10000:
+                    combined_set = set()
+                    for arr in candidate_sets:
+                        combined_set.update(arr)
+                    combined = np.array(list(combined_set), dtype=np.int32)
+                else:
+                    combined = np.unique(np.concatenate(candidate_sets))
+        elif total_size < 10000:
+            combined_set = set()
+            for arr in candidate_sets:
+                combined_set.update(arr)
+            combined = np.array(list(combined_set), dtype=np.int32)
+        else:
+            combined = np.unique(np.concatenate(candidate_sets))
+        
         return combined[combined > idx]
     
     def _cluster_rows_parallel(self) -> List[Tuple[int, int, float]]:
@@ -490,9 +565,17 @@ class Clusterer:
         source_cols = list(self.source.columns)
         source_array = self.source.values
         
+        # Create column position map for direct array access
+        col_to_pos = {col: i for i, col in enumerate(source_cols)}
+        
+        # Pre-calculate total weight for theoretical maximum score
+        total_possible_weight = sum(analysis.get('weight', 1.0) for col, analysis in self.column_analyses.items() 
+                                   if col in col_to_pos)
+        
         for idx1 in tqdm(range(size), desc="Clustering rows"):
             row1_values = source_array[idx1]
-            row1_dict = dict(zip(source_cols, row1_values))
+            # Only create dict/Series when needed for _get_candidate_indices
+            row1_dict = {col: row1_values[pos] for pos, col in enumerate(source_cols)}
             row1_series = pd.Series(row1_dict)
             
             candidate_indices = self._get_candidate_indices(row1_series, idx1)
@@ -500,39 +583,148 @@ class Clusterer:
             if len(candidate_indices) == 0:
                 continue
             
-            for idx2 in candidate_indices:
-                row2_values = source_array[idx2]
-                row2_dict = dict(zip(source_cols, row2_values))
+            if self.use_gpu and len(candidate_indices) >= self.gpu_batch_size:
+                batch_results = self._cluster_candidates_batch(
+                    idx1, row1_dict, candidate_indices, source_array, source_cols
+                )
+                results.extend(batch_results)
+            else:
+                for idx2 in candidate_indices:
+                    row2_values = source_array[idx2]
+                    
+                    total_score = 0.0
+                    total_weight = 0.0
+                    remaining_weight = total_possible_weight
+                    
+                    for col, analysis in self.column_analyses.items():
+                        # Use direct array indexing instead of dictionary lookups
+                        if col not in col_to_pos:
+                            continue
+                        
+                        weight = analysis.get('weight', 1.0)
+                        remaining_weight -= weight
+                        
+                        val1 = row1_values[col_to_pos[col]]
+                        val2 = row2_values[col_to_pos[col]]
+                        
+                        norm1_arr = self.source_normalized.get(col)
+                        norm2_arr = self.source_normalized.get(col)
+                        
+                        if norm1_arr is not None:
+                            normalized_val1 = norm1_arr[idx1] if isinstance(norm1_arr, np.ndarray) else norm1_arr.iloc[idx1]
+                        else:
+                            normalized_val1 = val1
+                        
+                        if norm2_arr is not None:
+                            normalized_val2 = norm2_arr[idx2] if isinstance(norm2_arr, np.ndarray) else norm2_arr.iloc[idx2]
+                        else:
+                            normalized_val2 = val2
+                        
+                        if pd.isna(normalized_val1) or pd.isna(normalized_val2) or normalized_val1 == '' or normalized_val2 == '':
+                            score = 0.0
+                        else:
+                            algorithm = analysis['algorithm']
+                            score = algorithm(str(normalized_val1), str(normalized_val2))
+                        
+                        total_score += score * weight
+                        total_weight += weight
+                        
+                        # Early termination: check if theoretical maximum is below threshold
+                        if total_weight > 0:
+                            current_score = total_score / total_weight
+                            # Theoretical max: assume all remaining columns score 1.0
+                            theoretical_max = (total_score + remaining_weight) / total_possible_weight if total_possible_weight > 0 else current_score
+                            if theoretical_max < self.threshold:
+                                break
+                    
+                    if total_weight > 0:
+                        overall_score = total_score / total_weight
+                        if overall_score >= self.threshold:
+                            results.append((idx1, int(idx2), overall_score))
+        
+        return results
+    
+    def _cluster_candidates_batch(
+        self, idx1: int, row1_dict: Dict, candidate_indices: np.ndarray,
+        source_array: np.ndarray, source_cols: List[str]
+    ) -> List[Tuple[int, int, float]]:
+        """
+        Cluster candidates in batch mode for better performance with many candidates.
+        
+        Returns:
+            List of tuples (idx1, idx2, overall_score) for matches above threshold
+        """
+        results = []
+        batch_size = self.gpu_batch_size
+        
+        # Create column position map once
+        col_to_pos = {col: i for i, col in enumerate(source_cols)}
+        
+        for batch_start in range(0, len(candidate_indices), batch_size):
+            batch_end = min(batch_start + batch_size, len(candidate_indices))
+            batch_indices = candidate_indices[batch_start:batch_end]
+            
+            batch_column_scores = []
+            
+            for col, analysis in self.column_analyses.items():
+                if col not in row1_dict:
+                    continue
                 
-                total_score = 0.0
-                total_weight = 0.0
+                val1 = row1_dict[col]
+                norm1_arr = self.source_normalized.get(col)
+                if norm1_arr is not None:
+                    normalized_val1 = norm1_arr[idx1] if isinstance(norm1_arr, np.ndarray) else norm1_arr.iloc[idx1]
+                else:
+                    normalized_val1 = val1
                 
-                for col, analysis in self.column_analyses.items():
-                    if col not in row1_dict or col not in row2_dict:
+                if pd.isna(normalized_val1) or normalized_val1 == '':
+                    batch_column_scores.append([0.0] * len(batch_indices))
+                    continue
+                
+                norm2_arr = self.source_normalized.get(col)
+                batch_queries = [str(normalized_val1)] * len(batch_indices)
+                batch_choices = []
+                
+                for idx2 in batch_indices:
+                    row2_values = source_array[idx2]
+                    if col not in col_to_pos:
+                        batch_choices.append('')
                         continue
                     
-                    val1 = row1_dict[col]
-                    val2 = row2_dict[col]
-                    
-                    norm1_arr = self.source_normalized.get(col)
-                    norm2_arr = self.source_normalized.get(col)
-                    
-                    if norm1_arr is not None:
-                        normalized_val1 = norm1_arr[idx1] if isinstance(norm1_arr, np.ndarray) else norm1_arr.iloc[idx1]
-                    else:
-                        normalized_val1 = val1
-                    
+                    val2 = row2_values[col_to_pos[col]]
                     if norm2_arr is not None:
                         normalized_val2 = norm2_arr[idx2] if isinstance(norm2_arr, np.ndarray) else norm2_arr.iloc[idx2]
                     else:
                         normalized_val2 = val2
                     
-                    if pd.isna(normalized_val1) or pd.isna(normalized_val2) or normalized_val1 == '' or normalized_val2 == '':
-                        score = 0.0
+                    if pd.isna(normalized_val2) or normalized_val2 == '':
+                        batch_choices.append('')
                     else:
-                        algorithm = analysis['algorithm']
-                        score = algorithm(str(normalized_val1), str(normalized_val2))
+                        batch_choices.append(str(normalized_val2))
+                
+                algorithm = analysis['algorithm']
+                algorithm_name = algorithm.__name__ if hasattr(algorithm, '__name__') else str(algorithm)
+                
+                if 'levenshtein' in algorithm_name.lower():
+                    scores = batch_levenshtein_similarity(batch_queries, batch_choices, batch_size=len(batch_choices))
+                elif 'jaro' in algorithm_name.lower():
+                    scores = batch_jaro_winkler_similarity(batch_queries, batch_choices, batch_size=len(batch_choices))
+                elif 'token' in algorithm_name.lower():
+                    scores = batch_token_set_ratio(batch_queries, batch_choices, batch_size=len(batch_choices))
+                else:
+                    scores = [algorithm(q, c) for q, c in zip(batch_queries, batch_choices)]
+                
+                batch_column_scores.append(scores)
+            
+            for i, idx2 in enumerate(batch_indices):
+                total_score = 0.0
+                total_weight = 0.0
+                
+                for j, (col, analysis) in enumerate(self.column_analyses.items()):
+                    if col not in row1_dict:
+                        continue
                     
+                    score = batch_column_scores[j][i] if j < len(batch_column_scores) else 0.0
                     weight = analysis.get('weight', 1.0)
                     total_score += score * weight
                     total_weight += weight
